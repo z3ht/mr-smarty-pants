@@ -4,3 +4,6 @@ sounddevice~=0.5.1
 openai~=1.75.0
 mss~=10.0.0
 python-dotenv~=1.1.0
+opencv-python~=4.11.0.86
+soundfile~=0.13.1
+textual~=3.1.0
