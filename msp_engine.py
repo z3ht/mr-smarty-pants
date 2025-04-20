@@ -50,6 +50,8 @@ VOICE_NAME = os.getenv("VOICE_NAME", "alloy")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 TTS_MODEL = os.getenv("TTS_MODEL", "gpt-4o-mini-tts")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1")
+SCREENSHOT_INTERVAL_S = float(os.getenv("SCREENSHOT_INTERVAL_S", "1"))
+MOTION_THRESHOLD = float(os.getenv("MOTION_THRESHOLD", "500"))
 
 client = AsyncOpenAI(api_key=API_KEY)
 
@@ -62,28 +64,32 @@ async def take_screenshot() -> bytes:
         return b""
 
     with mss() as sct:
+        # Define the bounding box for the screenshot
         bbox = {
             "left": SELECTED_WINDOW.left,
             "top": SELECTED_WINDOW.top,
             "width": SELECTED_WINDOW.width,
             "height": SELECTED_WINDOW.height,
         }
+
         raw = sct.grab(bbox)
+
         img = Image.frombytes("RGB", raw.size, raw.rgb)
         img.thumbnail((1280, 800))
 
-        # Save to disk
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        save_dir = "screenshots"
-        os.makedirs(save_dir, exist_ok=True)
-        filename = os.path.join(save_dir, f"screenshot_{timestamp}.jpg")
-        img.save(filename, format="JPEG", quality=80)
-        print(f"[screenshot] Saved to {filename}")
+        # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # save_dir = "screenshots"
+        # os.makedirs(save_dir, exist_ok=True)
+        # filename = os.path.join(save_dir, f"screenshot_{timestamp}.jpg")
+        #
+        # # Save the image as a JPEG file
+        # img.save(filename, format="JPEG", quality=80)
+        # print(f"[screenshot] Saved to {filename}")
 
-        # Also return as bytes
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=80)
         return buf.getvalue()
+
 
 # --- Mic Recorder ---
 class MicRecorder:
@@ -145,6 +151,7 @@ class MicRecorder:
                         recording_buffer = []
                         silence_frames = 0
 
+
 # --- Mic Stream ---
 async def mic_stream(mic_status_label: ft.Text) -> AsyncIterator[str]:
     queue: asyncio.Queue[np.ndarray] = asyncio.Queue()
@@ -180,6 +187,7 @@ async def mic_stream(mic_status_label: ft.Text) -> AsyncIterator[str]:
         recorder.stop()
         mic_status_label.value = "🛑 Idle"
         mic_status_label.update()
+
 
 # --- TTS Speaker ---
 class Speaker:
@@ -269,7 +277,7 @@ class Speaker:
                 pass
             self._speak_task = None
 
-# --- Main App ---
+
 def main(page: ft.Page):
     page.title = "Mr. Smarty Pants Assistant"
     page.vertical_alignment = "start"
@@ -280,9 +288,13 @@ def main(page: ft.Page):
     send_button = ft.ElevatedButton("Send")
     stop_button = ft.ElevatedButton("Stop Speaking", disabled=True)
     mic_status_label = ft.Text("🛑 Idle", size=12, color="green")
+    screenshot_switch = ft.Switch(label="Include Screenshots", value=True)
 
     speaker = Speaker()
     page.mic_task = None
+    page.screenshot_task = None
+    page.include_screenshots = screenshot_switch.value
+    page.screenshot_buffer = []  # List of (timestamp, bytes)
 
     history = [
         {"role": "system", "content": (
@@ -304,17 +316,17 @@ def main(page: ft.Page):
         )
         page.update()
 
-        shot = await take_screenshot()
-        if shot:
-            b64 = base64.b64encode(shot).decode()
-            user_content = [
-                {"type": "text", "text": user_text},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-            ]
-        else:
-            user_content = [
-                {"type": "text", "text": user_text}
-            ]
+        # Gather all screenshots taken so far
+        attachments = []
+        for ts, shot_bytes in page.screenshot_buffer:
+            b64 = base64.b64encode(shot_bytes).decode()
+            attachments.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
+            })
+        page.screenshot_buffer.clear()
+
+        user_content = [{"type": "text", "text": user_text}] + attachments
 
         history.append({"role": "user", "content": user_content})
 
@@ -369,35 +381,80 @@ def main(page: ft.Page):
             stop_button.disabled = True
             page.update()
 
+    def toggle_screenshot_switch(e):
+        page.include_screenshots = screenshot_switch.value
+        print(f"[screenshot] Include screenshots: {page.include_screenshots}")
+
+    screenshot_switch.on_change = toggle_screenshot_switch
+
     send_button.on_click = stop_speaking
     stop_button.on_click = stop_speaking
     input_field.on_submit = handle_send
 
     page.add(
         chat,
-        ft.Row([input_field, send_button, stop_button, mic_status_label])
+        ft.Row([input_field, send_button, stop_button, mic_status_label, screenshot_switch])
     )
 
     async def mic_listener():
         async for speech in mic_stream(mic_status_label):
             await send_message(speech)
 
+    async def screenshot_collector():
+        last_image = None
+
+        while not shutdown_event.is_set():
+            await asyncio.sleep(SCREENSHOT_INTERVAL_S)
+            if page.include_screenshots and SELECTED_WINDOW:
+                try:
+                    current_bytes = await take_screenshot()
+                    if not current_bytes:
+                        continue
+
+                    img = Image.open(io.BytesIO(current_bytes)).convert("L")  # grayscale
+                    img = img.resize((320, 200))  # small for speed
+                    img_arr = np.asarray(img, dtype=np.float32)
+
+                    if last_image is not None:
+                        mse = np.mean((img_arr - last_image) ** 2)
+                        if mse < MOTION_THRESHOLD:
+                            print("[motion] No significant change, skipping screenshot.")
+                            continue
+
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    page.screenshot_buffer.append((timestamp, current_bytes))
+                    print(f"[motion] Saved screenshot at {timestamp}.")
+                    last_image = img_arr
+
+                except Exception as e:
+                    print(f"[error] screenshot collector: {e}")
+
     page.mic_task = page.run_task(mic_listener)
+    page.screenshot_task = page.run_task(screenshot_collector)
 
     async def on_close(e):
         print("[shutdown] Cleaning up...")
         shutdown_event.set()
         await speaker.stop()
+
         if page.mic_task:
             try:
                 page.mic_task.cancel()
             except Exception as e:
                 print(f"[error] cancelling mic task: {e}")
+
+        if page.screenshot_task:
+            try:
+                page.screenshot_task.cancel()
+            except Exception as e:
+                print(f"[error] cancelling screenshot task: {e}")
+
         if speaker.current_stream:
             try:
                 speaker.current_stream.close()
             except Exception as e:
                 print(f"[error] closing stream on shutdown: {e}")
+
         await asyncio.sleep(0.1)
         print("[shutdown] Done.")
 
