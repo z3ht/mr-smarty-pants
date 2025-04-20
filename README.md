@@ -3,6 +3,7 @@
 minimal multimodal cli assistant
 
 Features:
+- flet terminal ui
 - Async event‑loop (asyncio)
 - Periodic screenshot capture (mss + Pillow) → JPEG bytes
 - Microphone capture → Whisper STT (OpenAI)
