@@ -51,7 +51,7 @@ VOICE_NAME = os.getenv("VOICE_NAME", "onyx")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 TTS_MODEL = os.getenv("TTS_MODEL", "gpt-4o-mini-tts")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1")
-SCREENSHOT_INTERVAL_S = float(os.getenv("SCREENSHOT_INTERVAL_S", "0.25"))
+SCREENSHOT_INTERVAL_S = float(os.getenv("SCREENSHOT_INTERVAL_S", "0.1"))
 MOTION_THRESHOLD = float(os.getenv("MOTION_THRESHOLD", "500"))
 SCREENSHOT_SIMILARITY_THRESHOLD_PCT = float(os.getenv("SCREENSHOT_SIMILARITY_THRESHOLD_PCT", "0.95"))
 MAX_SCREENSHOT_AGE_S = int(os.getenv("MAX_SCREENSHOT_AGE_S", "30"))
@@ -141,35 +141,6 @@ class TokenUsageTracker:
         available = self.tokens_available()
         return (f"<TokenUsageTracker used={used} available={available} "
                 f"limit={TOKEN_LIMIT_PER_M} tokens/min>")
-
-
-class SmartContextBuilder:
-    def __init__(self, system_prompt: dict, token_limit: int, max_turns: int = 10):
-        self.system_prompt = system_prompt
-        self.token_limit = token_limit
-        self.max_turns = max_turns
-
-    def trim(self, messages: list[dict]) -> list[dict]:
-        recent_messages = messages[-self.max_turns:]
-
-        used_tokens = estimate_message_tokens(self.system_prompt)
-        final_messages = []
-
-        for m in reversed(recent_messages):  # Start from newest
-            msg_tokens = estimate_message_tokens(m)
-            if used_tokens + msg_tokens > self.token_limit:
-                break
-            final_messages.append(m)
-            used_tokens += msg_tokens
-
-        return list(reversed(final_messages))  # Restore order for OpenAI
-
-    def build_context(self, messages: list[dict]) -> list[dict]:
-        trimmed = self.trim(messages)
-        return [self.system_prompt] + [
-            {k: v for k, v in m.items() if k in {"role", "content"}}
-            for m in trimmed
-        ]
 
 
 async def take_screenshot() -> bytes:
@@ -340,7 +311,7 @@ class Speaker:
                     raise
 
             self.current_stream = sd.OutputStream(
-                samplerate=40000,    # ~2x speed
+                samplerate=28000,    # ~1.4x speed
                 channels=1,
                 dtype="int16",
                 blocksize=240,
@@ -434,7 +405,6 @@ def main(page: ft.Page):
         )
         page.update()
 
-        # Attach latest screenshot (i'd like to attach more, but they're pretty expensive)
         attachments = []
         if page.screenshot_buffer:
             shot_time, shot_bytes = page.screenshot_buffer[-1]
@@ -458,15 +428,15 @@ def main(page: ft.Page):
         system_prompt = history[0]
         user_assistant_messages = history[1:]
 
-        available_tokens = token_tracker.tokens_available()
+        full_context = [system_prompt] + [
+            {k: v for k, v in m.items() if k in {"role", "content"}}
+            for m in user_assistant_messages
+        ]
 
-        builder = SmartContextBuilder(
-            system_prompt=system_prompt,
-            token_limit=available_tokens,
-            max_turns=MAX_HISTORY_MESSAGES
-        )
-
-        full_context = builder.build_context(user_assistant_messages)
+        needed_tokens = sum(estimate_message_tokens(m) for m in full_context)
+        await token_tracker.wait_for_tokens(needed_tokens)
+        token_tracker.add_tokens(needed_tokens)
+        print(f"[tokens] {token_tracker.tokens_used_last_minute()} tokens used in last 60s")
 
         try:
             stream = await client.chat.completions.create(
@@ -474,15 +444,13 @@ def main(page: ft.Page):
                 messages=full_context,
                 stream=True,
             )
-
-            estimated_tokens = sum(estimate_message_tokens(m) for m in full_context)
-            token_tracker.add_tokens(estimated_tokens)
-            print(f"[tokens] {token_tracker.tokens_used_last_minute()} tokens used in last 60s")
-
         except Exception as e:
             chat.controls.append(
                 ft.Container(
-                    content=ft.Text(f"[red]Error: {e}[/red]"),
+                    content=ft.Text(
+                        f"Error: {e}",
+                        color=ft.colors.RED
+                    ),
                     padding=10,
                     alignment=ft.alignment.center_left
                 )
