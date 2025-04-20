@@ -14,7 +14,7 @@ Todo:
 - record more screenshots. Allow the ai to detect possible bugs from in progress code
 
 Ideas:
-- day-in-review review session
+- day-in-review feedback session
 - bug repository
 - code base annotations
 - flet conversation tabbing, markdown support
