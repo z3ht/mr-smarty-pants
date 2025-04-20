@@ -1,31 +1,23 @@
-#!/usr/bin/env python3
-from __future__ import annotations
+import asyncio
 import base64
 import io
 import os
-from datetime import datetime
-from typing import List
+import threading
+from queue import Queue, Empty
+from typing import AsyncIterator
 
 import numpy as np
 import sounddevice as sd
+import soundfile as sf
+from dotenv import load_dotenv
 from mss import mss
 from PIL import Image
+import flet as ft
 from openai import AsyncOpenAI
-from dotenv import load_dotenv
-import soundfile as sf
-from textual.scroll_view import ScrollView
 
 from region_selector import select_region
-from textual.app import App, ComposeResult
-from textual.containers import Vertical
-from textual.widgets import Input, Static
-import asyncio
-from typing import AsyncIterator
 
-
-print(sd.query_devices())
-print("Selected sound input:", sd.default.device[0])
-
+# --- Setup environment ---
 load_dotenv()
 
 API_KEY = os.getenv("OPENAI_API_KEY")
@@ -37,11 +29,20 @@ VOICE_NAME = os.getenv("VOICE_NAME", "alloy")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 TTS_MODEL = os.getenv("TTS_MODEL", "gpt-4o-mini-tts")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1")
+
 client = AsyncOpenAI(api_key=API_KEY)
 
+# --- Global control ---
+current_stream = None
+stopping = False
+speaking_now = False
 
-os.makedirs("screenshots", exist_ok=True)
+# --- Select screen region ---
+print("Select screen region...")
 CROP_BOX = select_region()
+print(f"Selected region: {CROP_BOX}")
+
+# --- Screenshot ---
 
 async def take_screenshot() -> bytes:
     with mss() as sct:
@@ -53,227 +54,259 @@ async def take_screenshot() -> bytes:
         })
         img = Image.frombytes("RGB", raw.size, raw.rgb)
         img.thumbnail((1280, 800))
-
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=80)
-        data = buf.getvalue()
+        return buf.getvalue()
 
-        # Optionally still save it for debug purposes
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        path = f"screenshots/{ts}.jpg"
-        with open(path, "wb") as f:
-            f.write(data)
-
-        return data
-
+# --- Mic capture ---
 
 async def mic_stream() -> AsyncIterator[str]:
-    samplerate = 16000
-    frame_duration_ms = 100  # 0.1 sec per frame
-    frame_samples = int(samplerate * frame_duration_ms / 1000)
+    queue: asyncio.Queue[np.ndarray] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
 
-    recording_buffer = []
-    speaking = False
-    silence_frames = 0
-    silence_threshold = 500  # tune this: lower = more sensitive
-    max_silence_frames = AUDIO_CHUNK_S * 10     # <- number of frames per second
+    def record_loop():
+        samplerate = 16000
+        frame_duration_ms = 100
+        frame_samples = int(samplerate * frame_duration_ms / 1000)
+        recording_buffer = []
+        speaking = False
+        silence_frames = 0
+        silence_threshold = 500
+        max_silence_frames = AUDIO_CHUNK_S * 10
 
-    stream = sd.InputStream(
-        samplerate=samplerate,
-        channels=1,
-        dtype="int16",
-        blocksize=frame_samples,
-    )
-
-    with stream:
-        while True:
-            frame, _ = stream.read(frame_samples)
-            frame = frame.flatten()
-            rms = np.sqrt(np.mean(frame.astype(np.float32) ** 2))
-
-            if rms > silence_threshold:
-                if not speaking:
-                    print("[mic] Detected start of speech")
-                    speaking = True
-                recording_buffer.append(frame)
-                silence_frames = 0
-            elif speaking:
-                recording_buffer.append(frame)
-                silence_frames += 1
-                if silence_frames > max_silence_frames:
-                    print("[mic] Detected end of speech")
-
-                    # Save full recording
-                    audio_data = np.concatenate(recording_buffer)
-                    buf = io.BytesIO()
-                    sf.write(buf, audio_data, samplerate, format="WAV", subtype="PCM_16")
-                    buf.seek(0)
-                    buf.name = "speech.wav"
-
-                    print("Sending to Whisper...")
-                    text = await client.audio.transcriptions.create(
-                        model=WHISPER_MODEL,
-                        file=buf,
-                        response_format="text",
-                        language="en"
-                    )
-
-                    text = text.strip()
-                    print(f"[mic] {text}")
-                    yield text
-
-                    # Reset for next utterance
-                    speaking = False
-                    recording_buffer = []
-                    silence_frames = 0
-            else:
-                # not speaking, just keep waiting
-                await asyncio.sleep(frame_duration_ms / 1000)
-
-
-async def speak(text: str):
-    resp = await client.audio.speech.create(
-        model=TTS_MODEL,
-        voice=VOICE_NAME,
-        input=text,
-        response_format="pcm"
-    )
-    audio_bytes = resp.content
-    pcm = np.frombuffer(audio_bytes, dtype=np.int16)
-
-    sd.play(pcm, samplerate=24000)
-    sd.wait()
-
-
-class TextualKeyboardApp(App):
-    CSS = """
-    Screen {
-        align: center middle;
-    }
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.queue = asyncio.Queue()
-
-    def compose(self) -> ComposeResult:
-        with Vertical():
-            self.chat_history = ScrollView()
-            self.chat_history.update(Static("Welcome to AI Assistant!\n"))
-            yield self.chat_history
-
-            self.input = Input(placeholder="Type here and press Enter...")
-            yield self.input
-
-    async def on_input_submitted(self, event: Input.Submitted) -> None:
-        text = event.value.strip()
-        if text:
-            self.input.value = ""
-            await self.queue.put(text)
-            await self.chat_history.mount(Static(f"[You] {text}"))
-            await self.chat_history.scroll_end(animate=False)
-
-    async def keyboard_stream(self) -> AsyncIterator[str]:
-        while True:
-            text = await self.queue.get()
-            yield text
-textual_keyboard_app = TextualKeyboardApp()
-
-
-async def combined_input_stream() -> AsyncIterator[str]:
-    mic = mic_stream()
-    keyboard = textual_keyboard_app.keyboard_stream()
-
-    mic_task = asyncio.create_task(mic.__anext__())
-    keyboard_task = asyncio.create_task(keyboard.__anext__())
-
-    mic_alive = True
-    keyboard_alive = True
-
-    while mic_alive or keyboard_alive:
-        tasks = []
-        if mic_alive:
-            tasks.append(mic_task)
-        if keyboard_alive:
-            tasks.append(keyboard_task)
-
-        done, pending = await asyncio.wait(
-            tasks,
-            return_when=asyncio.FIRST_COMPLETED
+        stream = sd.InputStream(
+            samplerate=samplerate,
+            channels=1,
+            dtype="int16",
+            blocksize=frame_samples,
         )
 
-        for task in done:
+        with stream:
+            while True:
+                frame, _ = stream.read(frame_samples)
+                frame = frame.flatten()
+                rms = np.sqrt(np.mean(frame.astype(np.float32) ** 2))
+
+                if rms > silence_threshold:
+                    if not speaking:
+                        speaking = True
+                    recording_buffer.append(frame)
+                    silence_frames = 0
+                elif speaking:
+                    recording_buffer.append(frame)
+                    silence_frames += 1
+                    if silence_frames > max_silence_frames:
+                        audio_data = np.concatenate(recording_buffer)
+                        asyncio.run_coroutine_threadsafe(queue.put(audio_data), loop)
+                        speaking = False
+                        recording_buffer = []
+                        silence_frames = 0
+
+    threading.Thread(target=record_loop, daemon=True).start()
+
+    while True:
+        recording = await queue.get()
+        buf = io.BytesIO()
+        sf.write(buf, recording, 16000, format="WAV", subtype="PCM_16")
+        buf.seek(0)
+        buf.name = "speech.wav"
+
+        text_obj = await client.audio.transcriptions.create(
+            model=WHISPER_MODEL,
+            file=buf,
+            response_format="text",
+            language="en"
+        )
+
+        yield text_obj.strip()
+
+# --- TTS (chunked and stoppable version) ---
+
+async def speak(text: str, stop_button: ft.ElevatedButton, page: ft.Page):
+    global current_stream, stopping, speaking_now
+    try:
+        stopping = False
+        speaking_now = True
+        stop_button.disabled = False
+        page.update()
+
+        # Get AI speech audio
+        resp = await client.audio.speech.create(
+            model=TTS_MODEL,
+            voice=VOICE_NAME,
+            input=text,
+            response_format="pcm"
+        )
+        audio_bytes = resp.content
+        pcm = np.frombuffer(audio_bytes, dtype=np.int16)
+
+        # Setup queue for streaming
+        audio_queue = Queue()
+
+        # Feed audio into the queue in small pieces
+        chunk_size = 240  # very small chunks
+        for i in range(0, len(pcm), chunk_size):
+            audio_queue.put(pcm[i:i+chunk_size])
+        audio_queue.put(None)  # sentinel to mark end
+
+        def callback(outdata, frames, time, status):
             try:
-                text = task.result()
-            except StopAsyncIteration:
-                if task is mic_task:
-                    print("[combined_input_stream] mic_stream ended.")
-                    mic_alive = False
-                elif task is keyboard_task:
-                    print("[combined_input_stream] keyboard_stream ended.")
-                    keyboard_alive = False
-                continue
+                if stopping:
+                    raise sd.CallbackStop()
+                chunk = audio_queue.get_nowait()
+                if chunk is None:
+                    raise sd.CallbackStop()
+                outdata[:len(chunk)] = chunk.reshape(-1, 1)
+                if len(chunk) < len(outdata):
+                    outdata[len(chunk):] = 0
+            except Empty:
+                outdata.fill(0)
+            except sd.CallbackStop:
+                outdata.fill(0)
+                raise
 
-            yield text
+        current_stream = sd.OutputStream(
+            samplerate=24000,
+            channels=1,
+            dtype='int16',
+            blocksize=240,  # match chunk size
+            callback=callback
+        )
+        current_stream.start()
 
-            if task is mic_task and mic_alive:
-                mic_task = asyncio.create_task(mic.__anext__())
-            elif task is keyboard_task and keyboard_alive:
-                keyboard_task = asyncio.create_task(keyboard.__anext__())
+        # Wait until playback finishes
+        while current_stream.active:
+            if stopping:
+                current_stream.abort()
+                break
+            await asyncio.sleep(0.05)
 
-    print("[combined_input_stream] All sources exhausted. Shutting down.")
+        current_stream.close()
+        current_stream = None
 
+    except Exception as e:
+        print(f"[error] TTS failed: {e}")
+        current_stream = None
+    finally:
+        speaking_now = False
+        stop_button.disabled = True
+        page.update()
 
-async def chat_session():
-    inputs = combined_input_stream()
-    history: List[dict] = [
+# --- Main Flet App ---
+
+def main(page: ft.Page):
+    page.title = "Smart Assistant"
+    page.vertical_alignment = "start"
+
+    chat = ft.ListView(expand=True, spacing=10, auto_scroll=True)
+
+    input_field = ft.TextField(label="Type here...", expand=True)
+    send_button = ft.ElevatedButton("Send")
+    stop_button = ft.ElevatedButton("Stop Speaking", disabled=True)
+
+    history = [
         {"role": "system", "content": (
-            "You are an AI pair‑programmer. Your programmer is working hard so please don't distract him with "
-            "unimportant details. If he asks you a question, feel free to respond as your chat gpt agent would."
-            "Please use knowledge of your history to know if you're repeating redundant information"
+            "You are an AI assistant. Speak clearly, stay concise, and format code examples inside ``` blocks."
         )}
     ]
 
-    async for speech in inputs:
-        speech = speech.strip()
-        if not speech:
-            continue  # Ignore empty messages
+    async def send_message(user_text: str):
+        if not user_text.strip():
+            return
 
-        user_updates = [{"type": "text", "text": speech}]
+        chat.controls.append(
+            ft.Container(
+                content=ft.Markdown(f"**You:** {user_text}"),
+                padding=10,
+                alignment=ft.alignment.center_left
+            )
+        )
+        page.update()
 
-        # NEW: take screenshot *now*, right before sending
         shot = await take_screenshot()
         b64 = base64.b64encode(shot).decode()
-        user_updates.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
-        })
 
-        history.append({"role": "user", "content": user_updates})
+        user_content = [
+            {"type": "text", "text": user_text},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+        ]
 
-        stream = await client.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=history,
-            stream=True,
+        history.append({"role": "user", "content": user_content})
+
+        try:
+            stream = await client.chat.completions.create(
+                model=CHAT_MODEL,
+                messages=history,
+                stream=True,
+            )
+        except Exception as e:
+            chat.controls.append(
+                ft.Container(
+                    content=ft.Markdown(f"[red]Error: {e}[/red]"),
+                    padding=10,
+                    alignment=ft.alignment.center_left
+                )
+            )
+            page.update()
+            return
+
+        ai_message = ft.Text("", selectable=True)
+        ai_container = ft.Container(
+            content=ai_message,
+            padding=3,
+            alignment=ft.alignment.center_left
         )
+        chat.controls.append(ai_container)
+        page.update()
 
-        sentence_buf = ""
+        full_reply = ""
+
         async for delta in stream:
             part = delta.choices[0].delta.content or ""
-            print(part, end="", flush=True)
-            sentence_buf += part
-            if sentence_buf.endswith((".", "?", "!")):
-                if sentence_buf.lstrip().startswith("TALK:"):
-                    await speak(sentence_buf.lstrip()[5:].strip())
-                sentence_buf = ""
+            full_reply += part
+            ai_message.value = f"{full_reply}"
+            page.update()
 
+        if full_reply.strip():
+            await speak(full_reply.strip(), stop_button, page)
+            history.append({"role": "assistant", "content": full_reply.strip()})
 
-def main():
-    try:
-        asyncio.run(chat_session())
-    except KeyboardInterrupt:
-        print("\nExiting.")
+    async def handle_send(e=None):
+        user_text = input_field.value
+        input_field.value = ""
+        page.update()
+        await send_message(user_text)
 
+    def stop_speaking(e=None):
+        global current_stream, stopping, speaking_now
+        if speaking_now:
+            print("[stop] Stopping AI speech...")
+            stopping = True
+            if current_stream is not None:
+                try:
+                    current_stream.abort()
+                    current_stream.close()
+                except Exception as e:
+                    print(f"[stop] Error stopping: {e}")
+                finally:
+                    current_stream = None
+            speaking_now = False
+            stop_button.disabled = True
+            page.update()
 
-if __name__ == "__main__":
-    main()
+    send_button.on_click = handle_send
+    stop_button.on_click = stop_speaking
+    input_field.on_submit = handle_send
+
+    page.add(
+        chat,
+        ft.Row([input_field, send_button, stop_button])
+    )
+
+    async def mic_listener():
+        async for speech in mic_stream():
+            await send_message(speech)
+
+    page.run_task(mic_listener)
+
+ft.app(target=main)
