@@ -104,7 +104,7 @@ class TokenUsageTracker:
             self.usage.popleft()
 
     def add_tokens(self, tokens: int):
-        now = self._now()
+        now = self._now() + 1.0  # Add 1 second to account for send delay
         self.usage.append((now, tokens))
         self._prune_old_usage()
 
@@ -115,32 +115,48 @@ class TokenUsageTracker:
     def tokens_available(self) -> int:
         return TOKEN_LIMIT_PER_M - self.tokens_used_last_minute()
 
-    async def wait_for_tokens(self, needed_tokens: int, safety_margin_s: float = 0.10):
+    def seconds_until_tokens_available(self, needed_tokens: int, safety_margin_s: float = 0.10) -> float:
         """
-        Wait until there is room for needed_tokens within the rolling 60s window, w/ small safety margin.
+        Returns how many seconds until needed_tokens are available within the rolling 60s window.
+        Returns 0.0 if enough tokens are available right now.
         """
-        while True:
-            available = self.tokens_available()
-            if available >= needed_tokens:
-                break
+        self._prune_old_usage()
 
-            # Estimate when the oldest token will fall out of the window
-            if self.usage:
-                oldest_timestamp, _ = self.usage[0]
-                now = self._now()
-                wait_time = (oldest_timestamp + 60) - now + safety_margin_s
-                if wait_time > 0:
-                    await asyncio.sleep(wait_time)
-                else:
-                    await asyncio.sleep(safety_margin_s)
-            else:
-                await asyncio.sleep(safety_margin_s)
+        available = self.tokens_available()
+        if available >= needed_tokens or not self.usage:
+            return 0.0
+
+        now = self._now()
+        # Simulate future pruning
+        usage_list = list(self.usage)
+        idx = 0
+
+        while idx < len(usage_list):
+            oldest_timestamp, oldest_tokens = usage_list[idx]
+            idx += 1
+            # Advance time to when this usage entry will be pruned
+            simulated_now = oldest_timestamp + 60
+            # Recompute available tokens after removing all earlier entries
+            remaining_usage = usage_list[idx:]
+            used_tokens = sum(tokens for _, tokens in remaining_usage)
+            available_tokens = TOKEN_LIMIT_PER_M - used_tokens
+
+            if available_tokens >= needed_tokens:
+                wait_time = simulated_now - now + safety_margin_s
+                return max(0.0, wait_time)
+
+        # If even after 60s everything there isn't enough (unlikely), return wait after last entry
+        last_timestamp, _ = usage_list[-1]
+        wait_time = (last_timestamp + 60) - now + safety_margin_s
+        return max(0.0, wait_time)
 
     def __repr__(self):
         used = self.tokens_used_last_minute()
         available = self.tokens_available()
-        return (f"<TokenUsageTracker used={used} available={available} "
-                f"limit={TOKEN_LIMIT_PER_M} tokens/min>")
+        return f"<TokenUsageTracker used={used} available={available} limit={TOKEN_LIMIT_PER_M} tokens/min>"
+
+
+token_tracker = TokenUsageTracker()
 
 
 async def take_screenshot() -> bytes:
@@ -241,17 +257,34 @@ async def mic_stream() -> AsyncIterator[str]:
                 recording = await asyncio.wait_for(queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
+
             buf = io.BytesIO()
             sf.write(buf, recording, 16000, format="WAV", subtype="PCM_16")
             buf.seek(0)
             buf.name = "speech.wav"
 
+            # --- Estimate tokens needed for transcription ---
+            needed_tokens = 1000  # Rough guess for transcription input
+
+            # --- Wait if necessary ---
+            wait_s = token_tracker.seconds_until_tokens_available(needed_tokens=needed_tokens)
+            if wait_s > 0.0:
+                print(
+                    f"[tokens] Waiting {wait_s:.2f}s before transcribing (used={token_tracker.tokens_used_last_minute()} / limit={TOKEN_LIMIT_PER_M})"
+                )
+                await asyncio.sleep(wait_s)
+
+            print(f"[tokens] Using {needed_tokens} tokens for transcription (available={token_tracker.tokens_available()})")
+            token_tracker.add_tokens(needed_tokens)
+
+            # --- Send transcription request ---
             text_obj = await client.audio.transcriptions.create(
                 model=WHISPER_MODEL,
                 file=buf,
                 response_format="text",
                 language="en"
             )
+
             yield text_obj.strip()
     finally:
         recorder.stop()
@@ -278,12 +311,28 @@ class Speaker:
         page.update()
 
         try:
+            # --- Estimate tokens needed ---
+            needed_tokens = max(50, len(text) // 4)
+
+            # --- Wait if necessary ---
+            wait_s = token_tracker.seconds_until_tokens_available(needed_tokens=needed_tokens)
+            if wait_s > 0.0:
+                print(
+                    f"[tokens] Waiting {wait_s:.2f}s before speaking (used={token_tracker.tokens_used_last_minute()} / limit={TOKEN_LIMIT_PER_M})"
+                )
+                await asyncio.sleep(wait_s)
+
+            print(f"[tokens] Using {needed_tokens} tokens for speech (available={token_tracker.tokens_available()})")
+            token_tracker.add_tokens(needed_tokens)
+
+            # --- Send TTS request ---
             resp = await client.audio.speech.create(
                 model=TTS_MODEL,
                 voice=VOICE_NAME,
                 input=text,
                 response_format="pcm"
             )
+
             audio_bytes = resp.content
             pcm = np.frombuffer(audio_bytes, dtype=np.int16)
 
@@ -311,7 +360,7 @@ class Speaker:
                     raise
 
             self.current_stream = sd.OutputStream(
-                samplerate=28000,    # ~1.4x speed
+                samplerate=28000,  # ~1.4x speed
                 channels=1,
                 dtype="int16",
                 blocksize=240,
@@ -350,16 +399,6 @@ class Speaker:
 
 
 def main(page: ft.Page):
-    token_tracker = TokenUsageTracker()
-
-    async def handle_send(e=None):
-        user_text = input_field.value.strip()
-        if not user_text:
-            return
-        input_field.value = ""
-        page.update()
-        await send_message(user_text)
-
     page.title = "Mr. Smarty Pants Assistant"
     page.vertical_alignment = "start"
 
@@ -372,11 +411,13 @@ def main(page: ft.Page):
         min_lines=1,
         max_lines=15,
         shift_enter=True,
-        on_submit=handle_send
     )
-    send_button = ft.ElevatedButton("Send", on_click=handle_send)
+    send_button = ft.ElevatedButton("Send")
     status_button = ft.IconButton(content=ft.Text("🎤"), tooltip="Listening", disabled=False)
     screenshot_button = ft.IconButton(content=ft.Text("📸"), tooltip="Toggle Screenshots")
+
+    page.send_task = None
+    page.thinking_task = None
 
     page.include_screenshots = True
     page.screenshot_buffer = []
@@ -395,6 +436,22 @@ def main(page: ft.Page):
     async def send_message(user_text: str):
         now = datetime.now()
 
+        # --- Cancel any old thinking task ---
+        if page.thinking_task:
+            try:
+                page.thinking_task.cancel()
+            except Exception as e:
+                print(f"[error] cancelling previous thinking task: {e}")
+            page.thinking_task = None
+
+        # --- Clear old temporary thinking/waiting bubbles ---
+        chat.controls = [
+            c for c in chat.controls[-10:]
+            if not (isinstance(c, ft.Container) and isinstance(c.data, dict) and c.data.get("temporary"))
+        ]
+        page.update()
+
+        # --- Add user's new message ---
         chat.controls.append(
             ft.Container(
                 content=ft.Text(f"You: {user_text}", selectable=True, color="#BBBBBB"),
@@ -405,79 +462,141 @@ def main(page: ft.Page):
         )
         page.update()
 
+        # --- Prepare attachments (screenshots) ---
         attachments = []
         if page.screenshot_buffer:
             shot_time, shot_bytes = page.screenshot_buffer[-1]
-
             if (now - shot_time).total_seconds() <= MAX_SCREENSHOT_AGE_S:
                 b64 = base64.b64encode(shot_bytes).decode()
                 attachments.append({
                     "type": "image_url",
                     "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
                 })
-
             page.screenshot_buffer = [(shot_time, shot_bytes)]
         else:
             page.screenshot_buffer = []
 
+        # --- Update history ---
         history.append({
             "role": "user",
             "content": [{"type": "text", "text": user_text}] + attachments
         })
 
+        # --- Build full context ---
         system_prompt = history[0]
         user_assistant_messages = history[1:]
-
         full_context = [system_prompt] + [
-            {k: v for k, v in m.items() if k in {"role", "content"}}
-            for m in user_assistant_messages
+            {k: v for k, v in m.items() if k in {"role", "content"}} for m in user_assistant_messages
         ]
 
+        # --- Estimate needed tokens ---
         needed_tokens = sum(estimate_message_tokens(m) for m in full_context)
-        await token_tracker.wait_for_tokens(needed_tokens)
-        token_tracker.add_tokens(needed_tokens)
-        print(f"[tokens] {token_tracker.tokens_used_last_minute()} tokens used in last 60s")
 
+        # --- Setup thinking bubble ---
+        thinking_text = ft.Text("Thinking...", italic=True, selectable=True, color="#888888")
+        thinking_bubble = ft.Container(
+            content=thinking_text,
+            padding=8,
+            alignment=ft.alignment.center_left,
+            data={"temporary": True}
+        )
+        chat.controls.append(thinking_bubble)
+        page.update()
+
+        # --- Start merged thinking / waiting status ---
+        async def show_thinking_status(waiting_for_tokens: bool, needed_tokens: int):
+            if waiting_for_tokens:
+                while True:
+                    waiting_s = int(token_tracker.seconds_until_tokens_available(needed_tokens))
+                    if waiting_s <= 0:
+                        break
+                    thinking_text.value = f"Waiting for tokens... ({waiting_s}s)"
+                    page.update()
+                    await asyncio.sleep(1.0)
+                thinking_text.value = "Generating response..."
+                page.update()
+            else:
+                await asyncio.sleep(0.5)
+                thinking_text.value = "Generating response..."
+                page.update()
+
+        wait_s = token_tracker.seconds_until_tokens_available(needed_tokens)
+        waiting_for_tokens = wait_s > 0.0
+        page.thinking_task = asyncio.create_task(show_thinking_status(waiting_for_tokens, needed_tokens))
+
+        if waiting_for_tokens:
+            print(
+                f"[tokens] Waiting {wait_s:.2f}s (needed={needed_tokens}, used={token_tracker.tokens_used_last_minute()} / limit={TOKEN_LIMIT_PER_M})")
+            await asyncio.sleep(wait_s)
+        else:
+            print(f"[tokens] Using {needed_tokens} tokens (available={token_tracker.tokens_available()})")
+
+        # --- After waiting: officially consume tokens ---
+        token_tracker.add_tokens(needed_tokens)
+
+        # --- Send the chat completion request ---
         try:
             stream = await client.chat.completions.create(
                 model=CHAT_MODEL,
                 messages=full_context,
                 stream=True,
             )
+
+            if page.thinking_task:
+                try:
+                    page.thinking_task.cancel()
+                except Exception as e:
+                    print(f"[error] cancelling thinking task after wait: {e}")
+                page.thinking_task = None
+
         except Exception as e:
-            chat.controls.append(
-                ft.Container(
-                    content=ft.Text(
-                        f"Error: {e}",
-                        color=ft.colors.RED
-                    ),
-                    padding=10,
-                    alignment=ft.alignment.center_left
-                )
-            )
+            thinking_text.value = f"Error: {e}"
+            thinking_text.color = ft.colors.RED
             page.update()
             return
 
-        ai_message = ft.Text("", selectable=True)
-        ai_container = ft.Container(content=ai_message, padding=3, alignment=ft.alignment.center_left)
-        chat.controls.append(ai_container)
-        page.update()
-
         full_reply = ""
+        first_chunk = True
+        ai_message = None
+
+        # --- Stream the AI's response ---
         async for delta in stream:
             part = delta.choices[0].delta.content or ""
+            if not part:
+                continue
             full_reply += part
-            ai_message.value = full_reply
-            page.update()
+
+            if first_chunk:
+                ai_message = thinking_text
+                ai_message.value = part.strip()
+                ai_message.italic = False
+                ai_message.color = "#FFFFFF"
+
+                if isinstance(ai_message.parent, ft.Container):
+                    if isinstance(ai_message.parent.data, dict):
+                        ai_message.parent.data["temporary"] = False
+
+                page.update()
+                first_chunk = False
+            else:
+                ai_message.value = full_reply
+                page.update()
 
         full_reply = full_reply.strip()
-        final_text = full_reply
 
+        # --- Handle speaking or summarizing ---
         if full_reply:
             if len(full_reply) <= 100:
                 await speaker.speak(full_reply, status_button, page)
             else:
-                await token_tracker.wait_for_tokens(needed_tokens=500)
+                wait_s = token_tracker.seconds_until_tokens_available(needed_tokens=500)
+                if wait_s > 0.0:
+                    print(
+                        f"[tokens] Waiting {wait_s:.2f}s before summarizing (used={token_tracker.tokens_used_last_minute()} / limit={TOKEN_LIMIT_PER_M})")
+                    await asyncio.sleep(wait_s)
+
+                print(f"[tokens] Using 500 tokens for summarization (available={token_tracker.tokens_available()})")
+                token_tracker.add_tokens(500)
 
                 try:
                     summary_resp = await client.chat.completions.create(
@@ -492,7 +611,6 @@ def main(page: ft.Page):
                     if summary_text:
                         print(f"[summary] {summary_text}")
                         await speaker.speak(summary_text, status_button, page)
-                        final_text = summary_text
                     else:
                         print("[summary] No summary generated")
                 except Exception as e:
@@ -500,8 +618,35 @@ def main(page: ft.Page):
 
             history.append({
                 "role": "assistant",
-                "content": final_text
+                "content": full_reply
             })
+
+    async def handle_send(e=None):
+        user_text = input_field.value.strip()
+        if not user_text:
+            return
+        input_field.value = ""
+        page.update()
+
+        # Cancel any previous send_task if running
+        if page.send_task and not page.send_task.done():
+            try:
+                print(f"[handle_send] cancelling previous send task")
+                page.send_task.cancel()
+            except Exception as ex:
+                print(f"[error] problem cancelling previous send task: {ex}")
+
+        # Cancel previous thinking task too
+        if page.thinking_task:
+            try:
+                page.thinking_task.cancel()
+                print("[cancel] Previous thinking_task canceled.")
+            except Exception as ex:
+                print(f"[error] cancelling previous thinking task: {ex}")
+            page.thinking_task = None
+
+        # Start new send_message
+        page.send_task = asyncio.create_task(send_message(user_text))
 
     async def stop_speaking(e=None):
         if speaker.speaking:
@@ -582,5 +727,6 @@ def main(page: ft.Page):
         print("[shutdown] Done.")
 
     page.on_close = on_close
+
 
 ft.app(target=main)
