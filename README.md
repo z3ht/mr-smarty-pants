@@ -20,11 +20,11 @@ Ideas:
 - code base annotations
 - flet conversation tabbing, markdown support
 
-Cost: $0.50-$1.00 per hour
+Cost: $0.50-$2.00 per hour
+- significantly correlated with # of files being worked on
 
 Requires:
-- pyhton >= 3.11
-- python-tk required for generating screen capture bbox without specifying an application
+- python >= 3.11
 - OS level permissions for screen capture, accessibility, sound, and audio
 - All python packages defined in requirements.txt (e.g. `pip install -r requirements.txt`)
 - All keys from `example.env` specified in `.env`
