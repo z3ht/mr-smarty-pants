@@ -11,7 +11,7 @@ Features:
 - Streaming text‑to‑speech playback (OpenAI TTS + sounddevice)
 
 Todo:
-- text to speech is obnoxious. add significance thresholds
+- text to speech is obnoxious. add significance thresholds/summary logic
 - record more screenshots. Allow the ai to detect possible bugs from in progress code
 
 Ideas:
