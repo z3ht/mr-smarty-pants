@@ -278,23 +278,43 @@ class Speaker:
 
 
 def main(page: ft.Page):
+    async def handle_send(e=None):
+        user_text = input_field.value.strip()
+        if not user_text:
+            return
+        input_field.value = ""
+        page.update()
+        await send_message(user_text)
+
     page.title = "Mr. Smarty Pants Assistant"
     page.vertical_alignment = "start"
 
+    # Chat display
     chat = ft.ListView(expand=True, spacing=10, auto_scroll=True)
 
-    input_field = ft.TextField(label="Type your message...", expand=True)
-    send_button = ft.ElevatedButton("Send")
+    # Multiline input: Shift+Enter → newline; Enter → on_submit
+    input_field = ft.TextField(
+        label="Type your message…",
+        expand=True,
+        multiline=True,
+        min_lines=1,
+        max_lines=15,
+        shift_enter=True,       # enables Shift+Enter for newline
+        on_submit=handle_send   # fires when Enter is pressed without Shift
+    )
+    send_button = ft.ElevatedButton("Send", on_click=handle_send)
 
-    # single status button: mic when idle, stop when speaking
+    # Single status button: 🎤 when idle/listening, 🛑 when speaking
     status_button = ft.IconButton(
         content=ft.Text("🎤"),
         tooltip="Listening",
         disabled=False,
     )
 
+    # Screenshot toggle
     screenshot_button = ft.IconButton(content=ft.Text("📸"), tooltip="Toggle Screenshots")
 
+    # Screenshot buffer
     page.include_screenshots = True
     page.screenshot_buffer = []  # List of (timestamp, bytes)
 
@@ -302,9 +322,11 @@ def main(page: ft.Page):
     page.mic_task = None
     page.screenshot_task = None
 
+    # Conversation history
     history = [
         {"role": "system", "content": (
-            "You are Mr. Smarty Pants, an AI assistant. Speak clearly, stay concise, and format code examples inside triple backticks."
+            "You are Mr. Smarty Pants, an AI assistant. Speak clearly, stay concise, "
+            "and format code examples inside triple backticks."
         )}
     ]
 
@@ -312,9 +334,14 @@ def main(page: ft.Page):
         if not user_text.strip():
             return
 
+        # Add user message
         chat.controls.append(
             ft.Container(
-                content=ft.Text(f"You: {user_text}", selectable=True),
+                content=ft.Text(
+                    f"You: {user_text}",
+                    selectable=True,
+                    color="#BBBBBB"  # light gray
+                ),
                 padding=8,
                 alignment=ft.alignment.center_left,
                 expand=True
@@ -322,6 +349,7 @@ def main(page: ft.Page):
         )
         page.update()
 
+        # Attach screenshots
         attachments = []
         for ts, shot_bytes in page.screenshot_buffer:
             b64 = base64.b64encode(shot_bytes).decode()
@@ -333,6 +361,7 @@ def main(page: ft.Page):
 
         history.append({"role": "user", "content": [{"type": "text", "text": user_text}] + attachments})
 
+        # Stream AI response
         try:
             stream = await client.chat.completions.create(
                 model=CHAT_MODEL,
@@ -369,12 +398,6 @@ def main(page: ft.Page):
         if full_reply.strip():
             await speaker.speak(full_reply.strip(), status_button, page)
             history.append({"role": "assistant", "content": full_reply.strip()})
-
-    async def handle_send(e=None):
-        user_text = input_field.value
-        input_field.value = ""
-        page.update()
-        await send_message(user_text)
 
     async def stop_speaking(e=None):
         if speaker.speaking:
