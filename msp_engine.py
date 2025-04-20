@@ -512,7 +512,7 @@ def main(page: ft.Page):
                         break
                     thinking_text.value = f"Waiting for tokens... ({waiting_s}s)"
                     page.update()
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(0.5)
                 thinking_text.value = "Generating response..."
                 page.update()
             else:
