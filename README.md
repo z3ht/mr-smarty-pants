@@ -10,6 +10,17 @@ Features:
 - gpt4o-mini chat with text + image payloads
 - Streaming text‑to‑speech playback (OpenAI TTS + sounddevice)
 
+Cost: $0.50-$2.00 per hour
+- significantly correlated with # of files being worked on
+
+Requires:
+- python >= 3.11
+- OS level permissions for screen capture, accessibility, sound, and audio
+- All python packages defined in requirements.txt (e.g. `pip install -r requirements.txt`)
+- All keys from `example.env` specified in `.env`
+
+---
+
 Todo (prioritized):
 - Migrate to time based rate limiting only. Add waiting dialogue with time remaining
 - Add support for pasting selection as context rather than screenshots. Add hotkey context upload
@@ -34,12 +45,3 @@ Ideas:
 - bug repository
 - code base annotations
 - flet conversation tabbing, markdown support
-
-Cost: $0.50-$2.00 per hour
-- significantly correlated with # of files being worked on
-
-Requires:
-- python >= 3.11
-- OS level permissions for screen capture, accessibility, sound, and audio
-- All python packages defined in requirements.txt (e.g. `pip install -r requirements.txt`)
-- All keys from `example.env` specified in `.env`
