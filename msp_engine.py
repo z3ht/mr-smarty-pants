@@ -1,21 +1,42 @@
+import argparse
 import asyncio
 import base64
-import io
-import os
 import threading
 from queue import Queue, Empty
 from typing import AsyncIterator
 
+import os
+import io
+from datetime import datetime
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
 from dotenv import load_dotenv
 from mss import mss
 from PIL import Image
+import pywinctl as pwc
 import flet as ft
 from openai import AsyncOpenAI
 
-from region_selector import select_region
+# --- Parse Arguments ---
+parser = argparse.ArgumentParser(description="Run Mr. Smarty Pants")
+parser.add_argument("--window", type=str, help="Fuzzy match window title to capture")
+args = parser.parse_args()
+
+SELECTED_WINDOW = None
+
+if args.window:
+    all_windows = pwc.getAllWindows()
+
+    matches = [w for w in all_windows if args.window.lower() in w.title.lower()]
+    if not matches:
+        available_titles = [w.title for w in all_windows]
+        raise SystemExit(f"No matching window found for '{args.window}'. Available windows: {available_titles}")
+
+    SELECTED_WINDOW = matches[0]
+    print(f"[window capture] Selected window: {SELECTED_WINDOW.title}")
+else:
+    print("[window capture] No window selected; screenshots will be disabled.")
 
 # --- Setup environment ---
 load_dotenv()
@@ -35,22 +56,31 @@ client = AsyncOpenAI(api_key=API_KEY)
 # --- Global shutdown event ---
 shutdown_event = threading.Event()
 
-# --- Select screen region ---
-print("Select screen region...")
-CROP_BOX = select_region()
-print(f"Selected region: {CROP_BOX}")
 
-# --- Screenshot ---
 async def take_screenshot() -> bytes:
+    if not SELECTED_WINDOW:
+        return b""
+
     with mss() as sct:
-        raw = sct.grab({
-            "left": CROP_BOX[0],
-            "top": CROP_BOX[1],
-            "width": CROP_BOX[2],
-            "height": CROP_BOX[3],
-        })
+        bbox = {
+            "left": SELECTED_WINDOW.left,
+            "top": SELECTED_WINDOW.top,
+            "width": SELECTED_WINDOW.width,
+            "height": SELECTED_WINDOW.height,
+        }
+        raw = sct.grab(bbox)
         img = Image.frombytes("RGB", raw.size, raw.rgb)
         img.thumbnail((1280, 800))
+
+        # Save to disk
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_dir = "screenshots"
+        os.makedirs(save_dir, exist_ok=True)
+        filename = os.path.join(save_dir, f"screenshot_{timestamp}.jpg")
+        img.save(filename, format="JPEG", quality=80)
+        print(f"[screenshot] Saved to {filename}")
+
+        # Also return as bytes
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=80)
         return buf.getvalue()
@@ -116,19 +146,22 @@ class MicRecorder:
                         silence_frames = 0
 
 # --- Mic Stream ---
-async def mic_stream() -> AsyncIterator[str]:
+async def mic_stream(mic_status_label: ft.Text) -> AsyncIterator[str]:
     queue: asyncio.Queue[np.ndarray] = asyncio.Queue()
     recorder = MicRecorder(queue)
     recorder.start()
 
     try:
-        while True:
-            if shutdown_event.is_set():
-                break
+        while not shutdown_event.is_set():
             try:
+                mic_status_label.value = "🎤 Listening..."
+                mic_status_label.update()
                 recording = await asyncio.wait_for(queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
+
+            mic_status_label.value = "🛑 Idle"
+            mic_status_label.update()
 
             buf = io.BytesIO()
             sf.write(buf, recording, 16000, format="WAV", subtype="PCM_16")
@@ -145,15 +178,24 @@ async def mic_stream() -> AsyncIterator[str]:
             yield text_obj.strip()
     finally:
         recorder.stop()
+        mic_status_label.value = "🛑 Idle"
+        mic_status_label.update()
 
 # --- TTS Speaker ---
 class Speaker:
     def __init__(self):
         self.current_stream = None
-        self.stopping = False
         self.speaking = False
+        self.stopping = False
+        self._speak_task = None
 
     async def speak(self, text: str, stop_button: ft.ElevatedButton, page: ft.Page):
+        await self.stop()
+        self._speak_task = asyncio.create_task(
+            self._internal_speak(text, stop_button, page)
+        )
+
+    async def _internal_speak(self, text: str, stop_button: ft.ElevatedButton, page: ft.Page):
         self.stopping = False
         self.speaking = True
         stop_button.disabled = False
@@ -173,7 +215,7 @@ class Speaker:
             chunk_size = 240
 
             for i in range(0, len(pcm), chunk_size):
-                audio_queue.put(pcm[i:i+chunk_size])
+                audio_queue.put(pcm[i:i + chunk_size])
             audio_queue.put(None)
 
             def callback(outdata, frames, time, status):
@@ -195,7 +237,7 @@ class Speaker:
             self.current_stream = sd.OutputStream(
                 samplerate=24000,
                 channels=1,
-                dtype='int16',
+                dtype="int16",
                 blocksize=240,
                 callback=callback
             )
@@ -217,10 +259,15 @@ class Speaker:
             stop_button.disabled = True
             page.update()
 
-    def stop(self):
-        if not self.speaking:
-            return
-        self.stopping = True
+    async def stop(self):
+        if self._speak_task:
+            self.stopping = True
+            try:
+                self._speak_task.cancel()
+                await asyncio.sleep(0.05)
+            except Exception:
+                pass
+            self._speak_task = None
 
 # --- Main App ---
 def main(page: ft.Page):
@@ -232,8 +279,10 @@ def main(page: ft.Page):
     input_field = ft.TextField(label="Type your message...", expand=True)
     send_button = ft.ElevatedButton("Send")
     stop_button = ft.ElevatedButton("Stop Speaking", disabled=True)
+    mic_status_label = ft.Text("🛑 Idle", size=12, color="green")
 
     speaker = Speaker()
+    page.mic_task = None
 
     history = [
         {"role": "system", "content": (
@@ -256,12 +305,16 @@ def main(page: ft.Page):
         page.update()
 
         shot = await take_screenshot()
-        b64 = base64.b64encode(shot).decode()
-
-        user_content = [
-            {"type": "text", "text": user_text},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-        ]
+        if shot:
+            b64 = base64.b64encode(shot).decode()
+            user_content = [
+                {"type": "text", "text": user_text},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+            ]
+        else:
+            user_content = [
+                {"type": "text", "text": user_text}
+            ]
 
         history.append({"role": "user", "content": user_content})
 
@@ -309,37 +362,43 @@ def main(page: ft.Page):
         page.update()
         await send_message(user_text)
 
-    def stop_speaking(e=None):
+    async def stop_speaking(e=None):
         if speaker.speaking:
             print("[stop] Stopping AI speech...")
-            speaker.stop()
+            await speaker.stop()
             stop_button.disabled = True
             page.update()
 
-    send_button.on_click = handle_send
+    send_button.on_click = stop_speaking
     stop_button.on_click = stop_speaking
     input_field.on_submit = handle_send
 
     page.add(
         chat,
-        ft.Row([input_field, send_button, stop_button])
+        ft.Row([input_field, send_button, stop_button, mic_status_label])
     )
 
     async def mic_listener():
-        async for speech in mic_stream():
+        async for speech in mic_stream(mic_status_label):
             await send_message(speech)
 
-    page.run_task(mic_listener)
+    page.mic_task = page.run_task(mic_listener)
 
     async def on_close(e):
         print("[shutdown] Cleaning up...")
         shutdown_event.set()
-        speaker.stop()
+        await speaker.stop()
+        if page.mic_task:
+            try:
+                page.mic_task.cancel()
+            except Exception as e:
+                print(f"[error] cancelling mic task: {e}")
         if speaker.current_stream:
             try:
                 speaker.current_stream.close()
             except Exception as e:
                 print(f"[error] closing stream on shutdown: {e}")
+        await asyncio.sleep(0.1)
         print("[shutdown] Done.")
 
     page.on_close = on_close
