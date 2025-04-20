@@ -404,7 +404,7 @@ class Speaker:
         self.stopping = False
         self._speak_task = None
 
-    async def speak(self, text: str, status_button: ft.IconButton, page: ft.Page):
+    async def speak(self, text: str, status_button: ft.ElevatedButton, page: ft.Page):
         if not page.speech_enabled:
             print("[speak] Speech disabled; skipping speaking")
             return
@@ -413,12 +413,12 @@ class Speaker:
             self._internal_speak(text, status_button, page)
         )
 
-    async def _internal_speak(self, text: str, status_button: ft.IconButton, page: ft.Page):
+    async def _internal_speak(self, text: str, status_button: ft.ElevatedButton, page: ft.Page):
         self.stopping = False
         self.speaking = True
-        status_button.content.value = "🔇"
+        status_button.text = "Stop"
         status_button.tooltip = "Stop AI speech"
-        status_button.disabled = False
+        status_button.bgcolor = ft.Colors.BLUE_GREY_900
         page.update()
 
         try:
@@ -493,9 +493,9 @@ class Speaker:
             self.current_stream = None
             self.speaking = False
 
-            status_button.content.value = "🔈"
-            status_button.tooltip = "Responding"
-            status_button.disabled = False
+            status_button.text = "Send"
+            status_button.tooltip = "Send a message"
+            status_button.bgcolor = None
             page.update()
 
     async def stop(self):
@@ -677,7 +677,7 @@ def main(page: ft.Page):
 
         if full_reply:
             if len(full_reply) <= 100:
-                await speaker.speak(full_reply, speech_button, page)
+                await speaker.speak(full_reply, send_button, page)
             else:
                 wait_s = token_tracker.seconds_until_tokens_available(needed_tokens=500)
                 if wait_s > 0.0:
@@ -699,7 +699,7 @@ def main(page: ft.Page):
                     summary_text = summary_resp.choices[0].message.content.strip()
                     if summary_text:
                         print(f"[summary] {summary_text}")
-                        await speaker.speak(summary_text, speech_button, page)
+                        await speaker.speak(summary_text, send_button, page)
                     else:
                         print("[summary] No summary generated")
                 except Exception as e:
@@ -708,6 +708,7 @@ def main(page: ft.Page):
             context_manager.add_assistant_message(full_reply)
 
     async def handle_send(e=None):
+        print("[handle_send] send triggered")
         user_text = input_field.value.strip()
         if not user_text:
             return
@@ -730,6 +731,13 @@ def main(page: ft.Page):
             page.thinking_task = None
 
         page.send_task = asyncio.create_task(send_message(user_text))
+
+    async def handle_send_button(e=None):
+        if speaker.speaking:
+            print("[handle_send_button] Stopping speech instead of sending message")
+            await speaker.stop()
+        else:
+            await handle_send(e)
 
     def toggle_speech(e=None):
         page.speech_enabled = not page.speech_enabled
@@ -763,7 +771,7 @@ def main(page: ft.Page):
         mic_button.update()
         page.update()
 
-    send_button.on_click = handle_send
+    send_button.on_click = handle_send_button
     input_field.on_submit = handle_send
     mic_button.on_click = toggle_mic
     speech_button.on_click = toggle_speech
