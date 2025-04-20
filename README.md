@@ -26,6 +26,7 @@ Todo (prioritized):
 - Add support for pasting selection as context rather than screenshots. Add hotkey context upload
     - Support visualizing current context. Screenshot as part of text history.
     - Text blocks as part of history
+- Add mute functionality for tts and stt
 - Add support for clearing conversation
 - Investigate more optimal difference functions for screenshotting text. Also better compression algorithms. Also cheaper api endpoints.
 - Add dropdowns for settings that are defined in code. Two kinds of settings: intelligence and objective
