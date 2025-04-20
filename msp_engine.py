@@ -1,22 +1,25 @@
 import argparse
-import asyncio
 import base64
+import io
+import os
 import threading
+import asyncio
+from collections import deque
+from datetime import datetime, timedelta
 from queue import Queue, Empty
 from typing import AsyncIterator
 
-import os
-import io
-from datetime import datetime
+import flet as ft
 import numpy as np
+import pywinctl as pwc
 import sounddevice as sd
 import soundfile as sf
+from PIL import Image
 from dotenv import load_dotenv
 from mss import mss
-from PIL import Image
-import pywinctl as pwc
-import flet as ft
 from openai import AsyncOpenAI
+from skimage.metrics import structural_similarity as ssim
+import tiktoken
 
 # --- Parse Arguments ---
 parser = argparse.ArgumentParser(description="Run Mr. Smarty Pants")
@@ -27,12 +30,10 @@ SELECTED_WINDOW = None
 
 if args.window:
     all_windows = pwc.getAllWindows()
-
     matches = [w for w in all_windows if args.window.lower() in w.title.lower()]
     if not matches:
         available_titles = [w.title for w in all_windows]
         raise SystemExit(f"No matching window found for '{args.window}'. Available windows: {available_titles}")
-
     SELECTED_WINDOW = matches[0]
     print(f"[window capture] Selected window: {SELECTED_WINDOW.title}")
 else:
@@ -46,12 +47,16 @@ if not API_KEY:
     raise SystemExit("Missing OPENAI_API_KEY; set it in .env file")
 
 AUDIO_CHUNK_S = int(os.getenv("AUDIO_CHUNK_S", "3"))
-VOICE_NAME = os.getenv("VOICE_NAME", "alloy")
+VOICE_NAME = os.getenv("VOICE_NAME", "onyx")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 TTS_MODEL = os.getenv("TTS_MODEL", "gpt-4o-mini-tts")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1")
-SCREENSHOT_INTERVAL_S = float(os.getenv("SCREENSHOT_INTERVAL_S", "1"))
+SCREENSHOT_INTERVAL_S = float(os.getenv("SCREENSHOT_INTERVAL_S", "0.25"))
 MOTION_THRESHOLD = float(os.getenv("MOTION_THRESHOLD", "500"))
+SCREENSHOT_SIMILARITY_THRESHOLD_PCT = float(os.getenv("SCREENSHOT_SIMILARITY_THRESHOLD_PCT", "0.95"))
+MAX_SCREENSHOT_AGE_S = int(os.getenv("MAX_SCREENSHOT_AGE_S", "30"))
+MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "10"))
+TOKEN_LIMIT_PER_M = int(os.getenv("TOKEN_LIMIT_PER_M", "200_000"))
 
 client = AsyncOpenAI(api_key=API_KEY)
 
@@ -59,23 +64,127 @@ client = AsyncOpenAI(api_key=API_KEY)
 shutdown_event = threading.Event()
 
 
+def count_tokens(text: str) -> int:
+    encoding = tiktoken.encoding_for_model(CHAT_MODEL)
+    tokens = encoding.encode(text)
+    return len(tokens)
+
+
+def estimate_message_tokens(message: dict) -> int:
+    content = message.get("content")
+    total_tokens = 0
+
+    if isinstance(content, list):
+        for part in content:
+            if part.get("type") == "text":
+                total_tokens += count_tokens(part.get("text", ""))
+            elif part.get("type") == "image_url":
+                image_base64 = part.get("image_url", {}).get("url", "")
+                estimated_tokens = int(0.35 * len(image_base64))
+                total_tokens += estimated_tokens
+    elif isinstance(content, str):
+        total_tokens += count_tokens(content)
+
+    total_tokens += 3
+
+    return total_tokens
+
+
+class TokenUsageTracker:
+    def __init__(self):
+        self.usage = deque()  # stores (timestamp: float, tokens: int)
+
+    def _now(self) -> float:
+        return datetime.now().timestamp()
+
+    def _prune_old_usage(self):
+        cutoff_time = datetime.now() - timedelta(minutes=1)
+        cutoff_timestamp = cutoff_time.timestamp()
+        while self.usage and self.usage[0][0] < cutoff_timestamp:
+            self.usage.popleft()
+
+    def add_tokens(self, tokens: int):
+        now = self._now()
+        self.usage.append((now, tokens))
+        self._prune_old_usage()
+
+    def tokens_used_last_minute(self) -> int:
+        self._prune_old_usage()
+        return sum(tokens for _, tokens in self.usage)
+
+    def tokens_available(self) -> int:
+        return TOKEN_LIMIT_PER_M - self.tokens_used_last_minute()
+
+    async def wait_for_tokens(self, needed_tokens: int, safety_margin_s: float = 0.10):
+        """
+        Wait until there is room for needed_tokens within the rolling 60s window, w/ small safety margin.
+        """
+        while True:
+            available = self.tokens_available()
+            if available >= needed_tokens:
+                break
+
+            # Estimate when the oldest token will fall out of the window
+            if self.usage:
+                oldest_timestamp, _ = self.usage[0]
+                now = self._now()
+                wait_time = (oldest_timestamp + 60) - now + safety_margin_s
+                if wait_time > 0:
+                    await asyncio.sleep(wait_time)
+                else:
+                    await asyncio.sleep(safety_margin_s)
+            else:
+                await asyncio.sleep(safety_margin_s)
+
+    def __repr__(self):
+        used = self.tokens_used_last_minute()
+        available = self.tokens_available()
+        return (f"<TokenUsageTracker used={used} available={available} "
+                f"limit={TOKEN_LIMIT_PER_M} tokens/min>")
+
+
+class SmartContextBuilder:
+    def __init__(self, system_prompt: dict, token_limit: int, max_turns: int = 10):
+        self.system_prompt = system_prompt
+        self.token_limit = token_limit
+        self.max_turns = max_turns
+
+    def trim(self, messages: list[dict]) -> list[dict]:
+        recent_messages = messages[-self.max_turns:]
+
+        used_tokens = estimate_message_tokens(self.system_prompt)
+        final_messages = []
+
+        for m in reversed(recent_messages):  # Start from newest
+            msg_tokens = estimate_message_tokens(m)
+            if used_tokens + msg_tokens > self.token_limit:
+                break
+            final_messages.append(m)
+            used_tokens += msg_tokens
+
+        return list(reversed(final_messages))  # Restore order for OpenAI
+
+    def build_context(self, messages: list[dict]) -> list[dict]:
+        trimmed = self.trim(messages)
+        return [self.system_prompt] + [
+            {k: v for k, v in m.items() if k in {"role", "content"}}
+            for m in trimmed
+        ]
+
+
 async def take_screenshot() -> bytes:
     if not SELECTED_WINDOW:
         return b""
-
     with mss() as sct:
-        # Define the bounding box for the screenshot
         bbox = {
             "left": SELECTED_WINDOW.left,
             "top": SELECTED_WINDOW.top,
             "width": SELECTED_WINDOW.width,
             "height": SELECTED_WINDOW.height,
         }
-
         raw = sct.grab(bbox)
-
         img = Image.frombytes("RGB", raw.size, raw.rgb)
-        img.thumbnail((1280, 800))
+        img.thumbnail((800, 600))
 
         # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         # save_dir = "screenshots"
@@ -87,11 +196,10 @@ async def take_screenshot() -> bytes:
         # print(f"[screenshot] Saved to {filename}")
 
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=80)
+        img.save(buf, format="JPEG", quality=65)
         return buf.getvalue()
 
 
-# --- Mic Recorder ---
 class MicRecorder:
     def __init__(self, queue: asyncio.Queue[np.ndarray]):
         self.queue = queue
@@ -135,7 +243,6 @@ class MicRecorder:
                 frame, _ = self.stream.read(frame_samples)
                 frame = frame.flatten()
                 rms = np.sqrt(np.mean(frame.astype(np.float32) ** 2))
-
                 if rms > silence_threshold:
                     if not speaking:
                         speaking = True
@@ -163,7 +270,6 @@ async def mic_stream() -> AsyncIterator[str]:
                 recording = await asyncio.wait_for(queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
-
             buf = io.BytesIO()
             sf.write(buf, recording, 16000, format="WAV", subtype="PCM_16")
             buf.seek(0)
@@ -176,10 +282,8 @@ async def mic_stream() -> AsyncIterator[str]:
                 language="en"
             )
             yield text_obj.strip()
-
     finally:
         recorder.stop()
-
 
 class Speaker:
     def __init__(self):
@@ -197,8 +301,6 @@ class Speaker:
     async def _internal_speak(self, text: str, status_button: ft.IconButton, page: ft.Page):
         self.stopping = False
         self.speaking = True
-
-        # switch to Stop icon
         status_button.content.value = "🛑"
         status_button.tooltip = "Stop AI speech"
         status_button.disabled = False
@@ -238,7 +340,7 @@ class Speaker:
                     raise
 
             self.current_stream = sd.OutputStream(
-                samplerate=24000,
+                samplerate=40000,    # ~2x speed
                 channels=1,
                 dtype="int16",
                 blocksize=240,
@@ -260,7 +362,6 @@ class Speaker:
             self.current_stream = None
             self.speaking = False
 
-            # switch back to Mic icon
             status_button.content.value = "🎤"
             status_button.tooltip = "Listening"
             status_button.disabled = False
@@ -278,6 +379,8 @@ class Speaker:
 
 
 def main(page: ft.Page):
+    token_tracker = TokenUsageTracker()
+
     async def handle_send(e=None):
         user_text = input_field.value.strip()
         if not user_text:
@@ -289,40 +392,28 @@ def main(page: ft.Page):
     page.title = "Mr. Smarty Pants Assistant"
     page.vertical_alignment = "start"
 
-    # Chat display
     chat = ft.ListView(expand=True, spacing=10, auto_scroll=True)
 
-    # Multiline input: Shift+Enter → newline; Enter → on_submit
     input_field = ft.TextField(
         label="Type your message…",
         expand=True,
         multiline=True,
         min_lines=1,
         max_lines=15,
-        shift_enter=True,       # enables Shift+Enter for newline
-        on_submit=handle_send   # fires when Enter is pressed without Shift
+        shift_enter=True,
+        on_submit=handle_send
     )
     send_button = ft.ElevatedButton("Send", on_click=handle_send)
-
-    # Single status button: 🎤 when idle/listening, 🛑 when speaking
-    status_button = ft.IconButton(
-        content=ft.Text("🎤"),
-        tooltip="Listening",
-        disabled=False,
-    )
-
-    # Screenshot toggle
+    status_button = ft.IconButton(content=ft.Text("🎤"), tooltip="Listening", disabled=False)
     screenshot_button = ft.IconButton(content=ft.Text("📸"), tooltip="Toggle Screenshots")
 
-    # Screenshot buffer
     page.include_screenshots = True
-    page.screenshot_buffer = []  # List of (timestamp, bytes)
+    page.screenshot_buffer = []
 
     speaker = Speaker()
     page.mic_task = None
     page.screenshot_task = None
 
-    # Conversation history
     history = [
         {"role": "system", "content": (
             "You are Mr. Smarty Pants, an AI assistant. Speak clearly, stay concise, "
@@ -331,17 +422,11 @@ def main(page: ft.Page):
     ]
 
     async def send_message(user_text: str):
-        if not user_text.strip():
-            return
+        now = datetime.now()
 
-        # Add user message
         chat.controls.append(
             ft.Container(
-                content=ft.Text(
-                    f"You: {user_text}",
-                    selectable=True,
-                    color="#BBBBBB"  # light gray
-                ),
+                content=ft.Text(f"You: {user_text}", selectable=True, color="#BBBBBB"),
                 padding=8,
                 alignment=ft.alignment.center_left,
                 expand=True
@@ -349,25 +434,51 @@ def main(page: ft.Page):
         )
         page.update()
 
-        # Attach screenshots
+        # Attach latest screenshot (i'd like to attach more, but they're pretty expensive)
         attachments = []
-        for ts, shot_bytes in page.screenshot_buffer:
-            b64 = base64.b64encode(shot_bytes).decode()
-            attachments.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
-            })
-        page.screenshot_buffer.clear()
+        if page.screenshot_buffer:
+            shot_time, shot_bytes = page.screenshot_buffer[-1]
 
-        history.append({"role": "user", "content": [{"type": "text", "text": user_text}] + attachments})
+            if (now - shot_time).total_seconds() <= MAX_SCREENSHOT_AGE_S:
+                b64 = base64.b64encode(shot_bytes).decode()
+                attachments.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
+                })
 
-        # Stream AI response
+            page.screenshot_buffer = [(shot_time, shot_bytes)]
+        else:
+            page.screenshot_buffer = []
+
+        history.append({
+            "role": "user",
+            "content": [{"type": "text", "text": user_text}] + attachments
+        })
+
+        system_prompt = history[0]
+        user_assistant_messages = history[1:]
+
+        available_tokens = token_tracker.tokens_available()
+
+        builder = SmartContextBuilder(
+            system_prompt=system_prompt,
+            token_limit=available_tokens,
+            max_turns=MAX_HISTORY_MESSAGES
+        )
+
+        full_context = builder.build_context(user_assistant_messages)
+
         try:
             stream = await client.chat.completions.create(
                 model=CHAT_MODEL,
-                messages=history,
+                messages=full_context,
                 stream=True,
             )
+
+            estimated_tokens = sum(estimate_message_tokens(m) for m in full_context)
+            token_tracker.add_tokens(estimated_tokens)
+            print(f"[tokens] {token_tracker.tokens_used_last_minute()} tokens used in last 60s")
+
         except Exception as e:
             chat.controls.append(
                 ft.Container(
@@ -380,11 +491,7 @@ def main(page: ft.Page):
             return
 
         ai_message = ft.Text("", selectable=True)
-        ai_container = ft.Container(
-            content=ai_message,
-            padding=3,
-            alignment=ft.alignment.center_left
-        )
+        ai_container = ft.Container(content=ai_message, padding=3, alignment=ft.alignment.center_left)
         chat.controls.append(ai_container)
         page.update()
 
@@ -395,15 +502,43 @@ def main(page: ft.Page):
             ai_message.value = full_reply
             page.update()
 
-        if full_reply.strip():
-            await speaker.speak(full_reply.strip(), status_button, page)
-            history.append({"role": "assistant", "content": full_reply.strip()})
+        full_reply = full_reply.strip()
+        final_text = full_reply
+
+        if full_reply:
+            if len(full_reply) <= 100:
+                await speaker.speak(full_reply, status_button, page)
+            else:
+                await token_tracker.wait_for_tokens(needed_tokens=500)
+
+                try:
+                    summary_resp = await client.chat.completions.create(
+                        model=CHAT_MODEL,
+                        messages=[
+                            {"role": "system",
+                             "content": "Summarize the following text into a single concise sentence for speaking aloud."},
+                            {"role": "user", "content": full_reply}
+                        ]
+                    )
+                    summary_text = summary_resp.choices[0].message.content.strip()
+                    if summary_text:
+                        print(f"[summary] {summary_text}")
+                        await speaker.speak(summary_text, status_button, page)
+                        final_text = summary_text
+                    else:
+                        print("[summary] No summary generated")
+                except Exception as e:
+                    print(f"[summary error] {e}")
+
+            history.append({
+                "role": "assistant",
+                "content": final_text
+            })
 
     async def stop_speaking(e=None):
         if speaker.speaking:
             print("[stop] Stopping AI speech…")
             await speaker.stop()
-            page.update()
 
     def toggle_screenshots(e):
         page.include_screenshots = not page.include_screenshots
@@ -415,15 +550,7 @@ def main(page: ft.Page):
     status_button.on_click = stop_speaking
     screenshot_button.on_click = toggle_screenshots
 
-    page.add(
-        chat,
-        ft.Row([
-            input_field,
-            send_button,
-            status_button,
-            screenshot_button
-        ])
-    )
+    page.add(chat, ft.Row([input_field, send_button, status_button, screenshot_button]))
 
     async def mic_listener():
         async for speech in mic_stream():
@@ -444,14 +571,14 @@ def main(page: ft.Page):
                     img_arr = np.asarray(img, dtype=np.float32)
 
                     if last_image is not None:
-                        mse = np.mean((img_arr - last_image) ** 2)
-                        if mse < MOTION_THRESHOLD:
+                        similarity, _ = ssim(img_arr, last_image, data_range=255.0, full=True)
+                        if similarity > SCREENSHOT_SIMILARITY_THRESHOLD_PCT:
                             print("[motion] No significant change, skipping screenshot.")
                             continue
 
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    page.screenshot_buffer.append((timestamp, current_bytes))
-                    print(f"[motion] Saved screenshot at {timestamp}.")
+                    now = datetime.now()
+                    page.screenshot_buffer.append((now, current_bytes))
+                    print(f"[motion] Saved screenshot at {now.strftime('%Y%m%d_%H%M%S')}.")
                     last_image = img_arr
 
                 except Exception as e:
@@ -488,5 +615,4 @@ def main(page: ft.Page):
 
     page.on_close = on_close
 
-# --- Run App ---
 ft.app(target=main)
