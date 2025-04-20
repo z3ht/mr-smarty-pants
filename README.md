@@ -9,10 +9,21 @@ Features:
 - GPT‑4o chat with text + image payloads
 - Streaming text‑to‑speech playback (OpenAI TTS + sounddevice)
 
-Cost: $0.50 per hour
+Todo:
+- text to speech is obnoxious. add significance thresholds
+- record more screenshots. Allow the ai to detect possible bugs from in progress code
+
+Ideas:
+- day-in-review review session
+- bug repository
+- code base annotations
+- flet conversation tabbing, markdown support
+
+Cost: $0.50-$1.00 per hour
 
 Requires:
-- pyhton >= 3.11; python-tk required for window screen capture
+- pyhton >= 3.11
+- python-tk required for generating screen capture bbox without specifying an application
 - OS level permissions for screen capture, accessibility, sound, and audio
 - All python packages defined in requirements.txt (e.g. `pip install -r requirements.txt`)
 - All keys from `example.env` specified in `.env`
