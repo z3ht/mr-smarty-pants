@@ -152,8 +152,7 @@ class MicRecorder:
                         silence_frames = 0
 
 
-# --- Mic Stream ---
-async def mic_stream(mic_status_label: ft.Text) -> AsyncIterator[str]:
+async def mic_stream() -> AsyncIterator[str]:
     queue: asyncio.Queue[np.ndarray] = asyncio.Queue()
     recorder = MicRecorder(queue)
     recorder.start()
@@ -161,14 +160,9 @@ async def mic_stream(mic_status_label: ft.Text) -> AsyncIterator[str]:
     try:
         while not shutdown_event.is_set():
             try:
-                mic_status_label.value = "🎤 Listening..."
-                mic_status_label.update()
                 recording = await asyncio.wait_for(queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
-
-            mic_status_label.value = "🛑 Idle"
-            mic_status_label.update()
 
             buf = io.BytesIO()
             sf.write(buf, recording, 16000, format="WAV", subtype="PCM_16")
@@ -181,15 +175,12 @@ async def mic_stream(mic_status_label: ft.Text) -> AsyncIterator[str]:
                 response_format="text",
                 language="en"
             )
-
             yield text_obj.strip()
+
     finally:
         recorder.stop()
-        mic_status_label.value = "🛑 Idle"
-        mic_status_label.update()
 
 
-# --- TTS Speaker ---
 class Speaker:
     def __init__(self):
         self.current_stream = None
@@ -197,16 +188,20 @@ class Speaker:
         self.stopping = False
         self._speak_task = None
 
-    async def speak(self, text: str, stop_button: ft.ElevatedButton, page: ft.Page):
+    async def speak(self, text: str, status_button: ft.IconButton, page: ft.Page):
         await self.stop()
         self._speak_task = asyncio.create_task(
-            self._internal_speak(text, stop_button, page)
+            self._internal_speak(text, status_button, page)
         )
 
-    async def _internal_speak(self, text: str, stop_button: ft.ElevatedButton, page: ft.Page):
+    async def _internal_speak(self, text: str, status_button: ft.IconButton, page: ft.Page):
         self.stopping = False
         self.speaking = True
-        stop_button.disabled = False
+
+        # switch to Stop icon
+        status_button.content.value = "🛑"
+        status_button.tooltip = "Stop AI speech"
+        status_button.disabled = False
         page.update()
 
         try:
@@ -264,7 +259,11 @@ class Speaker:
                     print(f"[error] closing output stream: {e}")
             self.current_stream = None
             self.speaking = False
-            stop_button.disabled = True
+
+            # switch back to Mic icon
+            status_button.content.value = "🎤"
+            status_button.tooltip = "Listening"
+            status_button.disabled = False
             page.update()
 
     async def stop(self):
@@ -286,15 +285,22 @@ def main(page: ft.Page):
 
     input_field = ft.TextField(label="Type your message...", expand=True)
     send_button = ft.ElevatedButton("Send")
-    stop_button = ft.ElevatedButton("Stop Speaking", disabled=True)
-    mic_status_label = ft.Text("🛑 Idle", size=12, color="green")
-    screenshot_switch = ft.Switch(label="Include Screenshots", value=True)
+
+    # single status button: mic when idle, stop when speaking
+    status_button = ft.IconButton(
+        content=ft.Text("🎤"),
+        tooltip="Listening",
+        disabled=False,
+    )
+
+    screenshot_button = ft.IconButton(content=ft.Text("📸"), tooltip="Toggle Screenshots")
+
+    page.include_screenshots = True
+    page.screenshot_buffer = []  # List of (timestamp, bytes)
 
     speaker = Speaker()
     page.mic_task = None
     page.screenshot_task = None
-    page.include_screenshots = screenshot_switch.value
-    page.screenshot_buffer = []  # List of (timestamp, bytes)
 
     history = [
         {"role": "system", "content": (
@@ -316,7 +322,6 @@ def main(page: ft.Page):
         )
         page.update()
 
-        # Gather all screenshots taken so far
         attachments = []
         for ts, shot_bytes in page.screenshot_buffer:
             b64 = base64.b64encode(shot_bytes).decode()
@@ -326,9 +331,7 @@ def main(page: ft.Page):
             })
         page.screenshot_buffer.clear()
 
-        user_content = [{"type": "text", "text": user_text}] + attachments
-
-        history.append({"role": "user", "content": user_content})
+        history.append({"role": "user", "content": [{"type": "text", "text": user_text}] + attachments})
 
         try:
             stream = await client.chat.completions.create(
@@ -357,7 +360,6 @@ def main(page: ft.Page):
         page.update()
 
         full_reply = ""
-
         async for delta in stream:
             part = delta.choices[0].delta.content or ""
             full_reply += part
@@ -365,7 +367,7 @@ def main(page: ft.Page):
             page.update()
 
         if full_reply.strip():
-            await speaker.speak(full_reply.strip(), stop_button, page)
+            await speaker.speak(full_reply.strip(), status_button, page)
             history.append({"role": "assistant", "content": full_reply.strip()})
 
     async def handle_send(e=None):
@@ -376,33 +378,36 @@ def main(page: ft.Page):
 
     async def stop_speaking(e=None):
         if speaker.speaking:
-            print("[stop] Stopping AI speech...")
+            print("[stop] Stopping AI speech…")
             await speaker.stop()
-            stop_button.disabled = True
             page.update()
 
-    def toggle_screenshot_switch(e):
-        page.include_screenshots = screenshot_switch.value
-        print(f"[screenshot] Include screenshots: {page.include_screenshots}")
+    def toggle_screenshots(e):
+        page.include_screenshots = not page.include_screenshots
+        screenshot_button.content.value = "📸" if page.include_screenshots else "📷"
+        screenshot_button.update()
 
-    screenshot_switch.on_change = toggle_screenshot_switch
-
-    send_button.on_click = stop_speaking
-    stop_button.on_click = stop_speaking
+    send_button.on_click = handle_send
     input_field.on_submit = handle_send
+    status_button.on_click = stop_speaking
+    screenshot_button.on_click = toggle_screenshots
 
     page.add(
         chat,
-        ft.Row([input_field, send_button, stop_button, mic_status_label, screenshot_switch])
+        ft.Row([
+            input_field,
+            send_button,
+            status_button,
+            screenshot_button
+        ])
     )
 
     async def mic_listener():
-        async for speech in mic_stream(mic_status_label):
+        async for speech in mic_stream():
             await send_message(speech)
 
     async def screenshot_collector():
         last_image = None
-
         while not shutdown_event.is_set():
             await asyncio.sleep(SCREENSHOT_INTERVAL_S)
             if page.include_screenshots and SELECTED_WINDOW:
@@ -411,8 +416,8 @@ def main(page: ft.Page):
                     if not current_bytes:
                         continue
 
-                    img = Image.open(io.BytesIO(current_bytes)).convert("L")  # grayscale
-                    img = img.resize((320, 200))  # small for speed
+                    img = Image.open(io.BytesIO(current_bytes)).convert("L")
+                    img = img.resize((320, 200))
                     img_arr = np.asarray(img, dtype=np.float32)
 
                     if last_image is not None:
