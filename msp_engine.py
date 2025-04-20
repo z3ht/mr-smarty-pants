@@ -283,20 +283,29 @@ class MicRecorder:
         self.loop = asyncio.get_running_loop()
         self.thread = None
         self.stream = None
+        self.running = threading.Event()  # 👈 Local shutdown control
 
     def start(self):
+        if self.thread and self.thread.is_alive():
+            print("[MicRecorder] Recorder already running.")
+            return
+
+        self.running.set()
         self.thread = threading.Thread(target=self._record_loop, daemon=True)
         self.thread.start()
+        print("[MicRecorder] Recorder started.")
 
     def stop(self):
-        shutdown_event.set()
+        self.running.clear()
         if self.thread and self.thread.is_alive():
             self.thread.join()
         if self.stream:
             try:
                 self.stream.close()
+                print("[MicRecorder] Stream closed.")
             except Exception as e:
-                print(f"[error] closing input stream: {e}")
+                print(f"[MicRecorder] Error closing stream: {e}")
+        print("[MicRecorder] Recorder stopped.")
 
     def _record_loop(self):
         samplerate = 16000
@@ -316,7 +325,7 @@ class MicRecorder:
         )
 
         with self.stream:
-            while not shutdown_event.is_set():
+            while self.running.is_set():
                 frame, _ = self.stream.read(frame_samples)
                 frame = frame.flatten()
                 rms = np.sqrt(np.mean(frame.astype(np.float32) ** 2))
@@ -336,13 +345,23 @@ class MicRecorder:
                         silence_frames = 0
 
 
-async def mic_stream() -> AsyncIterator[str]:
+async def mic_stream(page: ft.Page) -> AsyncIterator[str]:
     queue: asyncio.Queue[np.ndarray] = asyncio.Queue()
-    recorder = MicRecorder(queue)
-    recorder.start()
+    recorder = None
 
     try:
         while not shutdown_event.is_set():
+            if page.mic_enabled:
+                if recorder is None:
+                    recorder = MicRecorder(queue)
+                    recorder.start()
+            else:
+                if recorder:
+                    recorder.stop()
+                    recorder = None
+                await asyncio.sleep(0.01)
+                continue
+
             try:
                 recording = await asyncio.wait_for(queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
@@ -353,10 +372,7 @@ async def mic_stream() -> AsyncIterator[str]:
             buf.seek(0)
             buf.name = "speech.wav"
 
-            # --- Estimate tokens needed for transcription ---
             needed_tokens = 1000  # Rough guess for transcription input
-
-            # --- Wait if necessary ---
             wait_s = token_tracker.seconds_until_tokens_available(needed_tokens=needed_tokens)
             if wait_s > 0.0:
                 print(
@@ -377,7 +393,9 @@ async def mic_stream() -> AsyncIterator[str]:
 
             yield text_obj.strip()
     finally:
-        recorder.stop()
+        if recorder:
+            recorder.stop()
+
 
 class Speaker:
     def __init__(self):
@@ -387,6 +405,9 @@ class Speaker:
         self._speak_task = None
 
     async def speak(self, text: str, status_button: ft.IconButton, page: ft.Page):
+        if not page.speech_enabled:
+            print("[speak] Speech disabled; skipping speaking")
+            return
         await self.stop()
         self._speak_task = asyncio.create_task(
             self._internal_speak(text, status_button, page)
@@ -395,7 +416,7 @@ class Speaker:
     async def _internal_speak(self, text: str, status_button: ft.IconButton, page: ft.Page):
         self.stopping = False
         self.speaking = True
-        status_button.content.value = "🛑"
+        status_button.content.value = "🔇"
         status_button.tooltip = "Stop AI speech"
         status_button.disabled = False
         page.update()
@@ -472,8 +493,8 @@ class Speaker:
             self.current_stream = None
             self.speaking = False
 
-            status_button.content.value = "🎤"
-            status_button.tooltip = "Listening"
+            status_button.content.value = "🔈"
+            status_button.tooltip = "Responding"
             status_button.disabled = False
             page.update()
 
@@ -503,14 +524,29 @@ def main(page: ft.Page):
         shift_enter=True,
     )
     send_button = ft.ElevatedButton("Send")
-    status_button = ft.IconButton(content=ft.Text("🎤"), tooltip="Listening", disabled=False)
-    screenshot_button = ft.IconButton(content=ft.Text("📸"), tooltip="Toggle Screenshots")
+
+    speech_button = ft.IconButton(
+        content=ft.Text("🔇"),
+        tooltip="Toggle speech (TTS)"
+    )
+    page.speech_enabled = False
+
+    mic_button = ft.IconButton(
+        content=ft.Text("🎙️"),
+        tooltip="Toggle microphone (STT)"
+    )
+    page.mic_enabled = False
+
+    screenshot_button = ft.IconButton(
+        content=ft.Text("📷"),
+        tooltip="Toggle screenshots",
+    )
+    page.include_screenshots = False
+    page.screenshot_buffer = []
 
     speaker = Speaker()
     page.send_task = None
     page.thinking_task = None
-    page.include_screenshots = True
-    page.screenshot_buffer = []
 
     system_prompt = {
         "role": "system",
@@ -521,6 +557,7 @@ def main(page: ft.Page):
     }
     context_manager = ContextManager(system_prompt)
 
+    # --- Handle user send ---
     async def send_message(user_text: str):
         if page.thinking_task:
             try:
@@ -549,9 +586,7 @@ def main(page: ft.Page):
         page.screenshot_buffer.clear()
 
         context_manager.add_user_message(user_text)
-
         full_context = context_manager.build_context()
-
         needed_tokens = sum(estimate_message_tokens(m) for m in full_context)
 
         thinking_text = ft.Text("Thinking...", italic=True, selectable=True, color="#888888")
@@ -642,7 +677,7 @@ def main(page: ft.Page):
 
         if full_reply:
             if len(full_reply) <= 100:
-                await speaker.speak(full_reply, status_button, page)
+                await speaker.speak(full_reply, speech_button, page)
             else:
                 wait_s = token_tracker.seconds_until_tokens_available(needed_tokens=500)
                 if wait_s > 0.0:
@@ -664,7 +699,7 @@ def main(page: ft.Page):
                     summary_text = summary_resp.choices[0].message.content.strip()
                     if summary_text:
                         print(f"[summary] {summary_text}")
-                        await speaker.speak(summary_text, status_button, page)
+                        await speaker.speak(summary_text, speech_button, page)
                     else:
                         print("[summary] No summary generated")
                 except Exception as e:
@@ -696,25 +731,49 @@ def main(page: ft.Page):
 
         page.send_task = asyncio.create_task(send_message(user_text))
 
-    async def stop_speaking(e=None):
-        if speaker.speaking:
-            print("[stop] Stopping AI speech...")
-            await speaker.stop()
+    def toggle_speech(e=None):
+        page.speech_enabled = not page.speech_enabled
+        if page.speech_enabled:
+            speech_button.content = ft.Text("🔈")
+            speech_button.tooltip = "Speech Enabled (click to mute speech)"
+            print("[toggle_speech] Speech enabled.")
+        else:
+            speech_button.content = ft.Text("🔇")
+            speech_button.tooltip = "Speech Muted (click to unmute speech)"
+            print("[toggle_speech] Speech disabled.")
+        speech_button.update()
 
-    def toggle_screenshots(e):
+    def toggle_screenshots(e=None):
         page.include_screenshots = not page.include_screenshots
         screenshot_button.content.value = "📸" if page.include_screenshots else "📷"
+        screenshot_button.content.tooltip = "Taking screenshots" if page.include_screenshots else "Screenshots disabled"
         screenshot_button.update()
+        print(f"[toggle_screenshots] Screenshots {'enabled' if page.include_screenshots else 'disabled'}.")
+
+    def toggle_mic(e=None):
+        page.mic_enabled = not page.mic_enabled
+        if page.mic_enabled:
+            mic_button.content = ft.Text("🔴")
+            mic_button.tooltip = "Listening (click to mute)"
+            print("[toggle_mic] Mic enabled.")
+        else:
+            mic_button.content = ft.Text("🎙️")
+            mic_button.tooltip = "Muted (click to unmute)"
+            print("[toggle_mic] Mic disabled.")
+        mic_button.update()
+        page.update()
 
     send_button.on_click = handle_send
     input_field.on_submit = handle_send
-    status_button.on_click = stop_speaking
+    mic_button.on_click = toggle_mic
+    speech_button.on_click = toggle_speech
+
     screenshot_button.on_click = toggle_screenshots
 
-    page.add(chat, ft.Row([input_field, send_button, status_button, screenshot_button]))
+    page.add(chat, ft.Row([input_field, send_button, speech_button, mic_button, screenshot_button]))
 
     async def mic_listener():
-        async for speech in mic_stream():
+        async for speech in mic_stream(page):
             await send_message(speech)
 
     async def screenshot_collector():
@@ -734,12 +793,9 @@ def main(page: ft.Page):
                     if last_image is not None:
                         similarity, _ = ssim(img_arr, last_image, data_range=255.0, full=True)
                         if similarity > SCREENSHOT_SIMILARITY_THRESHOLD_PCT:
-                            print("[motion] No significant change, skipping screenshot.")
                             continue
 
-                    now = datetime.now()
                     page.screenshot_buffer.append(current_bytes)
-                    print(f"[motion] Saved screenshot at {now.strftime('%Y%m%d_%H%M%S')}.")
                     last_image = img_arr
 
                 except Exception as e:
@@ -748,9 +804,11 @@ def main(page: ft.Page):
     page.mic_task = page.run_task(mic_listener)
     page.screenshot_task = page.run_task(screenshot_collector)
 
-    async def on_close(e):
+    async def on_close(e=None):
         print("[shutdown] Cleaning up...")
+
         shutdown_event.set()
+
         await speaker.stop()
 
         if page.mic_task:
