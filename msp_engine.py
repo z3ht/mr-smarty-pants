@@ -1,5 +1,4 @@
 import argparse
-import base64
 import io
 import os
 import threading
@@ -20,6 +19,8 @@ from mss import mss
 from openai import AsyncOpenAI
 from skimage.metrics import structural_similarity as ssim
 import tiktoken
+
+from msp.ocr_screenshot import extract_code_text
 
 # --- Parse Arguments ---
 parser = argparse.ArgumentParser(description="Run Mr. Smarty Pants")
@@ -159,20 +160,13 @@ class ContextManager:
     def __init__(self, system_prompt: dict):
         self.system_prompt = system_prompt
         self.history: List[dict] = []
-        self.latest_screenshots: List[dict] = []
+        self.latest_screenshots: List[bytes] = []
 
     def _now(self) -> datetime:
         return datetime.now()
 
     def set_latest_screenshots(self, screenshots: List[bytes]) -> None:
-        parts = []
-        for img_bytes in screenshots:
-            b64 = base64.b64encode(img_bytes).decode()
-            parts.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
-            })
-        self.latest_screenshots = parts
+        self.latest_screenshots = screenshots
 
     def add_user_message(self, text: str) -> None:
         self.history.append({
@@ -200,19 +194,18 @@ class ContextManager:
             role = message["role"]
             text_content = message["content"]
 
-            is_most_recent = (i == 0)
-            screenshots_to_include = (
-                self.latest_screenshots[-NUM_LATEST_SCREENSHOTS:]
-                if is_most_recent and role == "user" and self.latest_screenshots
-                else []
-            )
-
-            content = [{"type": "text", "text": text_content}] + screenshots_to_include
-
             assembled.append({
                 "role": role,
-                "content": content
+                "content": [{"type": "text", "text": text_content}]
             })
+
+            if i == 0 and role == "user" and self.latest_screenshots:
+                for png in self.latest_screenshots[-NUM_LATEST_SCREENSHOTS:]:
+                    code_block = extract_code_text(png)
+                    assembled.append({
+                        "role": role,
+                        "content": [{"type": "text", "text": code_block}]
+                    })
 
         full_context = context + list(reversed(assembled))
 
@@ -234,10 +227,10 @@ async def take_screenshot() -> bytes:
             "top": win.top,
             "width": win.width,
             "height": win.height,
+            "title": win.title
         }
 
     if _last_selected is None:
-        # First time: find window
         all_windows = pwc.getAllWindows()
         matches = [w for w in all_windows if WINDOW_NAME.lower() in w.title.lower()]
         if not matches:
@@ -246,7 +239,6 @@ async def take_screenshot() -> bytes:
         _last_selected = matches[0]
         _last_bbox = get_bbox(_last_selected)
     else:
-        # Window exists: check if its bbox changed
         current_bbox = get_bbox(_last_selected)
         if current_bbox != _last_bbox:
             print("[screenshot] Window bbox changed, refreshing...")
@@ -258,23 +250,24 @@ async def take_screenshot() -> bytes:
             _last_selected = matches[0]
             _last_bbox = get_bbox(_last_selected)
 
+    if WINDOW_NAME.lower() not in _last_bbox["title"].lower():
+        print("[screenshot] Lost bbox, refreshing on next screenshot...")
+        _last_selected = None
+        return b""
+
     with mss() as sct:
         raw = sct.grab(_last_bbox)
         img = Image.frombytes("RGB", raw.size, raw.rgb)
 
-    max_dim = 1600
-    if img.width > max_dim or img.height > max_dim:
-        img.thumbnail((max_dim, max_dim))
-
-    # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    # save_dir = "screenshots"
-    # os.makedirs(save_dir, exist_ok=True)
-    # filename = os.path.join(save_dir, f"screenshot_{timestamp}.jpg")
-    # img.save(filename, format="JPEG", quality=92, optimize=True)
-    # print(f"[screenshot] Saved to {filename}")
+        # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # save_dir = "screenshots"
+        # os.makedirs(save_dir, exist_ok=True)
+        # filename = os.path.join(save_dir, f"screenshot_{timestamp}.png")
+        # img.save(filename, format="PNG")
+        # print(f"[screenshot] Saved to {filename}")
 
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=92, optimize=True)
+    img.save(buf, format="PNG")
     return buf.getvalue()
 
 
@@ -594,7 +587,7 @@ def main(page: ft.Page):
         )
         page.update()
 
-        context_manager.set_latest_screenshots(page.screenshot_buffer)
+        context_manager.set_latest_screenshots(page.screenshot_buffer.copy())
         page.screenshot_buffer.clear()
 
         context_manager.add_user_message(user_text)
@@ -655,7 +648,10 @@ def main(page: ft.Page):
 
         except Exception as e:
             thinking_text.value = f"Error: {e}"
-            thinking_text.color = ft.colors.RED
+            thinking_text.color = ft.Colors.RED
+            if isinstance(thinking_text.parent, ft.Container):
+                if isinstance(thinking_text.parent.data, dict):
+                    thinking_text.parent.data["temporary"] = False
             page.update()
             return
 
@@ -820,6 +816,7 @@ def main(page: ft.Page):
 
     async def screenshot_collector():
         last_image = None
+
         while not shutdown_event.is_set():
             await asyncio.sleep(SCREENSHOT_INTERVAL_S)
             if page.include_screenshots and WINDOW_NAME:
@@ -837,9 +834,8 @@ def main(page: ft.Page):
                         if similarity > SCREENSHOT_SIMILARITY_THRESHOLD_PCT:
                             continue
 
-                    page.screenshot_buffer.append(current_bytes)
                     last_image = img_arr
-
+                    page.screenshot_buffer.append(current_bytes)
                 except Exception as e:
                     print(f"[error] screenshot collector: {e}")
 
