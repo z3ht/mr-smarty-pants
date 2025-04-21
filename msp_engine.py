@@ -26,11 +26,12 @@ parser = argparse.ArgumentParser(description="Run Mr. Smarty Pants")
 parser.add_argument("--window", type=str, help="Fuzzy match window title to capture")
 args = parser.parse_args()
 
-
 WINDOW_NAME = args.window if args.window else None
+
 
 # --- Setup environment ---
 load_dotenv()
+ASSETS_DIR = os.path.join(os.path.dirname(__file__), "assets")
 
 API_KEY = os.getenv("OPENAI_API_KEY")
 if not API_KEY:
@@ -544,6 +545,17 @@ def main(page: ft.Page):
     page.include_screenshots = False
     page.screenshot_buffer = []
 
+    end_conversation_button = ft.IconButton(
+            content=ft.Image(
+            src=os.path.join(ASSETS_DIR, "logo.png"),
+            width=50,
+            height=50,
+            fit=ft.ImageFit.CONTAIN,
+        ),
+        tooltip="New conversation",
+        padding=0
+    )
+
     speaker = Speaker()
     page.send_task = None
     page.thinking_task = None
@@ -771,14 +783,36 @@ def main(page: ft.Page):
         mic_button.update()
         page.update()
 
+    def end_conversation(e=None):
+        print("[end_conversation] Ending conversation...")
+
+        chat.controls.clear()
+        context_manager.history.clear()
+        page.screenshot_buffer.clear()
+
+        page.update()
+
     send_button.on_click = handle_send_button
     input_field.on_submit = handle_send
     mic_button.on_click = toggle_mic
     speech_button.on_click = toggle_speech
+    end_conversation_button.on_click = end_conversation
 
     screenshot_button.on_click = toggle_screenshots
 
-    page.add(chat, ft.Row([input_field, send_button, speech_button, mic_button, screenshot_button]))
+    page.add(
+        ft.Container(
+            ft.Row(
+                [end_conversation_button],
+                alignment=ft.MainAxisAlignment.START,
+                spacing=0,
+            ),
+            padding=0,
+            margin=0,
+        ),
+        chat,
+        ft.Row([input_field, send_button, speech_button, mic_button, screenshot_button]),
+    )
 
     async def mic_listener():
         async for speech in mic_stream(page):
@@ -842,4 +876,5 @@ def main(page: ft.Page):
 
     page.on_close = on_close
 
-ft.app(target=main)
+
+ft.app(target=main, assets_dir="assets")
