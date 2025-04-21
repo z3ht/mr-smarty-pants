@@ -1,6 +1,6 @@
 ### mr-smarty-pants
 
-![Logo](assets/logo.png)
+<img src="assets/logo.png" alt="Logo" width="200"/>
 
 minimal multimodal cli assistant
 
