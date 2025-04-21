@@ -1,5 +1,7 @@
 ### mr-smarty-pants
 
+![Logo](assets/logo.png)
+
 minimal multimodal cli assistant
 
 Features:
