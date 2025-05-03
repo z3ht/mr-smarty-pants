@@ -442,7 +442,6 @@ def main(page: ft.Page):
     }
     context_manager = ContextManager(system_prompt)
 
-    # --- Handle user send ---
     async def send_message(user_text: str):
         if page.thinking_task:
             try:
@@ -660,13 +659,14 @@ def main(page: ft.Page):
         page.update()
 
     conversation_name_field = ft.TextField(
+        label="Name",
         autofocus=True,
         width=350,
     )
 
     dlg_end_convo = ft.AlertDialog(
         modal=True,
-        title=ft.Text("Name:"),
+        title=ft.Text("Save Chat?"),
         content=conversation_name_field,
         actions_alignment=ft.MainAxisAlignment.END,
     )
@@ -675,7 +675,6 @@ def main(page: ft.Page):
     _prev_key_handler = page.on_keyboard_event
 
     def _close_cleanup_end_convo_dlg(e=None, clear_chat=True):
-        dlg_end_convo.open = False
         page.on_keyboard_event = _prev_key_handler
 
         if clear_chat:
@@ -683,6 +682,7 @@ def main(page: ft.Page):
             page.screenshot_buffer.clear()
             context_manager.clear()
 
+        dlg_end_convo.open = False
         page.update()
 
     def _save_conversation(e=None):
@@ -771,7 +771,7 @@ def main(page: ft.Page):
     async def on_close(e=None):
         print("[shutdown] Cleaning up...")
 
-        end_conversation()
+        context_manager.save_conversation("__on_close__")
 
         shutdown_event.set()
 
@@ -799,6 +799,7 @@ def main(page: ft.Page):
         print("[shutdown] Done.")
 
     page.on_close = on_close
+    page.on_disconnect = on_close
 
 
 ft.app(target=main, assets_dir=os.path.join(PROJECT_DIR, "assets"))
