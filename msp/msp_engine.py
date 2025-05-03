@@ -17,7 +17,7 @@ from mss import mss
 from openai import AsyncOpenAI
 from skimage.metrics import structural_similarity as ssim
 
-from msp.history_utils import unique_history_basename, get_previous_conversation_names
+from msp.history_utils import unique_history_basename, get_previous_conversation_names, save_last_closed_conversation, get_last_closed_conversation
 from msp.settings import OPENAI_API_KEY, TOKEN_LIMIT_PER_M, WINDOW_NAME, AUDIO_CHUNK_S, WHISPER_MODEL, VOICE_NAME, \
     TTS_MODEL, ASSETS_DIR, CHAT_MODEL, SCREENSHOT_INTERVAL_S, SCREENSHOT_SIMILARITY_THRESHOLD_PCT, PROJECT_DIR
 from msp.context_manager import ContextManager
@@ -418,14 +418,15 @@ def main(page: ft.Page):
     }
     context_manager = ContextManager(system_prompt)
 
+    current_stem: str | None = None
+    pending_load_stem: str | None = None
+
     sidebar = ft.Column(spacing=4, width=190)
     sidebar.visible = False
 
     def toggle_sidebar():
         sidebar.visible = not sidebar.visible
-        toggle_sidebar_btn.tooltip = (
-            "Hide history" if sidebar.visible else "Show history"
-        )
+        toggle_sidebar_btn.tooltip = "Hide history" if sidebar.visible else "Show history"
         page.update()
 
     toggle_sidebar_btn = ft.IconButton(
@@ -437,20 +438,29 @@ def main(page: ft.Page):
         ),
         tooltip="Show history",
         on_click=lambda e: toggle_sidebar(),
-        style=ft.ButtonStyle(padding=ft.padding.all(0))
+        style=ft.ButtonStyle(padding=ft.padding.all(0)),
     )
 
-    def _load_chat(e: ft.ControlEvent):
-        stem = e.control.data
-        do_load_conversation(stem)
+    def do_save_conversation(name: str, *, is_internal_stem_name: bool = False) -> str:
+        nonlocal current_stem
+        if not is_internal_stem_name:
+            name = unique_history_basename(name)
+        context_manager.save_conversation(name)
+        chat.save_view(name)
+        current_stem = name
+        return name
+
+    def do_load_conversation(stem_name: str):
+        nonlocal current_stem
+        context_manager.load_conversation(stem_name)
+        chat.load_view(stem_name)
+        current_stem = stem_name
 
     def refresh_sidebar():
         sidebar.controls.clear()
-
         sidebar.controls.append(
             ft.Container(end_conversation_button, padding=0, margin=0, alignment=ft.alignment.center_right)
         )
-
         for stem in get_previous_conversation_names():
             sidebar.controls.append(
                 ft.TextButton(
@@ -462,15 +472,18 @@ def main(page: ft.Page):
             )
         sidebar.update()
 
-    def do_save_conversation(name, is_internal_stem_name: bool = False):
-        if not is_internal_stem_name:
-            name = unique_history_basename(name)
-        context_manager.save_conversation(name)
-        chat.save_view(name)
+    def _load_chat(e: ft.ControlEvent):
+        nonlocal pending_load_stem, current_stem
 
-    def do_load_conversation(stem_name):
-        context_manager.load_conversation(stem_name)
-        chat.load_view(stem_name)
+        new_stem = e.control.data
+        if current_stem is None or current_stem.startswith("__"):
+            pending_load_stem = new_stem
+            end_conversation()
+            return
+
+        do_save_conversation(current_stem, is_internal_stem_name=True)
+        do_load_conversation(new_stem)
+        refresh_sidebar()
 
     async def send_message(user_text: str):
         if page.thinking_task:
@@ -619,11 +632,7 @@ def main(page: ft.Page):
         mic_button.update()
         page.update()
 
-    conversation_name_field = ft.TextField(
-        label="Name",
-        autofocus=True,
-        width=350,
-    )
+    conversation_name_field = ft.TextField(label="Name", autofocus=True, width=350)
 
     dlg_end_convo = ft.AlertDialog(
         modal=True,
@@ -635,27 +644,37 @@ def main(page: ft.Page):
 
     _prev_key_handler = page.on_keyboard_event
 
-    def _close_cleanup_end_convo_dlg(e=None, clear_chat=True):
+    def _close_cleanup_end_convo_dlg(e=None, *, clear_chat: bool = True):
+        nonlocal current_stem, pending_load_stem
         page.on_keyboard_event = _prev_key_handler
 
         if clear_chat:
             chat.clear()
             page.screenshot_buffer.clear()
             context_manager.clear()
+            current_stem = "__on_close__"
+        else:
+            pending_load_stem = None
 
         refresh_sidebar()
         dlg_end_convo.open = False
         page.update()
 
+        if clear_chat and pending_load_stem:
+            do_load_conversation(pending_load_stem)
+            pending_load_stem = None
+            refresh_sidebar()
+
     def _save_conversation(e=None):
         name = conversation_name_field.value.strip()
+        if not name:
+            return
         do_save_conversation(name)
         _close_cleanup_end_convo_dlg()
 
     def _end_convo_dlg_key_handler(e: ft.KeyboardEvent):
         if not dlg_end_convo.open:
             return
-
         if e.key == "Escape":
             _close_cleanup_end_convo_dlg(clear_chat=False)
         elif e.key == "Enter" and not (e.alt or e.ctrl or e.shift):
@@ -668,11 +687,19 @@ def main(page: ft.Page):
     ]
 
     def end_conversation(e=None):
-        print("[end_conversation] Ending conversation...")
-        conversation_name_field.value = ""
-        dlg_end_convo.open = True
-        page.on_keyboard_event = _end_convo_dlg_key_handler
-        page.update()
+        nonlocal current_stem
+        print("[end_conversation] Ending conversation…")
+
+        if current_stem is None or current_stem.startswith("__"):
+            conversation_name_field.value = ""
+            dlg_end_convo.open = True
+            page.on_keyboard_event = _end_convo_dlg_key_handler
+            page.update()
+            return
+
+        do_save_conversation(current_stem, is_internal_stem_name=True)
+        _close_cleanup_end_convo_dlg()
+
 
     send_button.on_click = handle_send_button
     input_field.on_submit = handle_send
@@ -701,7 +728,7 @@ def main(page: ft.Page):
     )
 
     refresh_sidebar()
-    do_load_conversation("__on_close__")
+    do_load_conversation(get_last_closed_conversation())
 
     async def mic_listener():
         async for speech in mic_stream(page):
@@ -738,7 +765,9 @@ def main(page: ft.Page):
     async def on_close(e=None):
         print("[shutdown] Cleaning up...")
 
-        do_save_conversation("__on_close__", is_internal_stem_name=True)
+        stem_to_save = current_stem
+        do_save_conversation(stem_to_save, is_internal_stem_name=True)
+        save_last_closed_conversation(stem_to_save)
 
         shutdown_event.set()
 

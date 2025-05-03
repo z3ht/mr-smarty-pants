@@ -55,3 +55,30 @@ def get_previous_conversation_names() -> list[str]:
         common_stems,
         key=lambda stem: (-_parse_timestamp(stem).timestamp(), stem.split(":", 1)[1].lower())
     )
+
+
+def _last_closed_path() -> str:
+    return os.path.join(PROJECT_DIR, "history", "last_closed.txt")
+
+
+def get_last_closed_conversation() -> str:
+    path = _last_closed_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            stem = f.read().strip()
+            return stem or "__on_close__"
+    except FileNotFoundError:
+        return "__on_close__"
+
+
+def save_last_closed_conversation(stem: str | None) -> None:
+    _ensure_history_dirs()
+    if not stem:
+        stem = "__on_close__"
+
+    path = _last_closed_path()
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(stem)
+    except OSError:
+        pass
