@@ -17,6 +17,7 @@ from mss import mss
 from openai import AsyncOpenAI
 from skimage.metrics import structural_similarity as ssim
 
+from msp.chat_search import SearchBar
 from msp.history_utils import unique_history_basename, get_previous_conversation_names, save_last_closed_conversation, get_last_closed_conversation
 from msp.settings import OPENAI_API_KEY, TOKEN_LIMIT_PER_M, WINDOW_NAME, AUDIO_CHUNK_S, WHISPER_MODEL, VOICE_NAME, \
     TTS_MODEL, ASSETS_DIR, CHAT_MODEL, SCREENSHOT_INTERVAL_S, SCREENSHOT_SIMILARITY_THRESHOLD_PCT, PROJECT_DIR
@@ -418,6 +419,8 @@ def main(page: ft.Page):
     }
     context_manager = ContextManager(system_prompt)
 
+    search_bar = SearchBar(chat, page)
+
     current_stem: str | None = None
     pending_load_stem: str | None = None
 
@@ -499,7 +502,7 @@ def main(page: ft.Page):
         full_context = context_manager.build_context()
         needed_tokens = sum(estimate_message_tokens(m) for m in full_context)
 
-        thinking_bubble: ChatBubble = chat.start_thinking()
+        thinking_bubble: ChatBubble = chat.start_ai()
         thinking_text = thinking_bubble.text
 
         async def show_thinking_status(waiting: bool):
@@ -700,6 +703,14 @@ def main(page: ft.Page):
         do_save_conversation(current_stem, is_internal_stem_name=True)
         _close_cleanup_end_convo_dlg()
 
+    def _page_key_handler(e: ft.KeyboardEvent):
+        if (e.key.lower() == "f" and e.ctrl) or (e.key.lower() == "f" and e.meta):
+            if search_bar.visible:
+                search_bar.close()
+            else:
+                search_bar.open()
+
+    page.on_keyboard_event = _page_key_handler
 
     send_button.on_click = handle_send_button
     input_field.on_submit = handle_send
@@ -712,6 +723,7 @@ def main(page: ft.Page):
     main_col = ft.Column(
         [
             chat,
+            search_bar,
             ft.Row(
                 [toggle_sidebar_btn, input_field, send_button, speech_button, mic_button, screenshot_button]
             ),
