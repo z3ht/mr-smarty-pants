@@ -1,5 +1,10 @@
+import os
+import pickle
+
 import flet as ft
 from typing import Optional
+
+from msp.settings import PROJECT_DIR
 
 
 class ChatBubble(ft.Container):
@@ -64,16 +69,53 @@ class ChatView(ft.Column):
         if self.page:
             self.page.update()
 
-    def cleanup(self, keep_last: int = 10):
-        self._lv.controls = [
-            c
-            for c in self._lv.controls[-keep_last:]
-            if not (isinstance(c, ft.Container) and c.data.get("temporary"))
-        ]
-        if self.page:
-            self.page.update()
-
     def clear(self):
         self._lv.controls.clear()
         if self.page:
             self.page.update()
+
+    def save_view(self, stem_name: str):
+        file_path = os.path.join(PROJECT_DIR, "history", "view", f"{stem_name}.pkl")
+        export = []
+        for ctrl in self._lv.controls:
+            if isinstance(ctrl, ft.Container) and isinstance(ctrl.content, ft.Text):
+                export.append(
+                    {
+                        "sender": (
+                            ctrl.data.get("sender")
+                            if isinstance(ctrl.data, dict)
+                            else None
+                        ),
+                        "text": ctrl.content.value,
+                    }
+                )
+
+        with open(file_path, "wb") as f:
+            pickle.dump(export, f)
+
+    def load_view(self, stem_name: str) -> bool:
+        file_path = os.path.join(PROJECT_DIR, "history", "view", f"{stem_name}.pkl")
+        if not os.path.exists(file_path):
+            print(f"[ChatView.load_view] File not found: {file_path}")
+            return False
+
+        try:
+            with open(file_path, "rb") as f:
+                export = pickle.load(f)
+        except Exception as e:
+            print(f"[ChatView.load_view] Error reading {file_path}: {e}")
+            return False
+
+        self.clear()
+
+        for entry in export:
+            sender = entry.get("sender") or "assistant"
+            text = entry.get("text", "")
+            bubble = ChatBubble(text, sender=sender, temporary=False)
+            self._lv.controls.append(bubble)
+
+        if self.page:
+            self.page.update()
+
+        return True
+

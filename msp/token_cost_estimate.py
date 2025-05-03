@@ -26,6 +26,6 @@ def estimate_message_tokens(message: dict) -> int:
     elif isinstance(content, str):
         total_tokens += count_tokens(content)
 
-    total_tokens += 3  # small constant overhead per message
+    total_tokens += 3 # small constant overhead per message
 
     return total_tokens

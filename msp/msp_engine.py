@@ -17,6 +17,7 @@ from mss import mss
 from openai import AsyncOpenAI
 from skimage.metrics import structural_similarity as ssim
 
+from msp.history_utils import unique_history_basename, get_previous_conversation_names
 from msp.settings import OPENAI_API_KEY, TOKEN_LIMIT_PER_M, WINDOW_NAME, AUDIO_CHUNK_S, WHISPER_MODEL, VOICE_NAME, \
     TTS_MODEL, ASSETS_DIR, CHAT_MODEL, SCREENSHOT_INTERVAL_S, SCREENSHOT_SIMILARITY_THRESHOLD_PCT, PROJECT_DIR
 from msp.context_manager import ContextManager
@@ -54,10 +55,6 @@ class TokenUsageTracker:
         return TOKEN_LIMIT_PER_M - self.tokens_used_last_minute()
 
     def seconds_until_tokens_available(self, needed_tokens: int, safety_margin_s: float = 0.10) -> float:
-        """
-        Returns how many seconds until needed_tokens are available within the rolling 60s window.
-        Returns 0.0 if enough tokens are available right now.
-        """
         self._prune_old_usage()
 
         available = self.tokens_available()
@@ -65,16 +62,13 @@ class TokenUsageTracker:
             return 0.0
 
         now = self._now()
-        # Simulate future pruning
         usage_list = list(self.usage)
         idx = 0
 
         while idx < len(usage_list):
             oldest_timestamp, oldest_tokens = usage_list[idx]
             idx += 1
-            # Advance time to when this usage entry will be pruned
             simulated_now = oldest_timestamp + 60
-            # Recompute available tokens after removing all earlier entries
             remaining_usage = usage_list[idx:]
             used_tokens = sum(tokens for _, tokens in remaining_usage)
             available_tokens = TOKEN_LIMIT_PER_M - used_tokens
@@ -83,7 +77,6 @@ class TokenUsageTracker:
                 wait_time = simulated_now - now + safety_margin_s
                 return max(0.0, wait_time)
 
-        # If even after 60s everything there isn't enough (unlikely), return wait after last entry
         last_timestamp, _ = usage_list[-1]
         wait_time = (last_timestamp + 60) - now + safety_margin_s
         return max(0.0, wait_time)
@@ -158,7 +151,7 @@ class MicRecorder:
         self.loop = asyncio.get_running_loop()
         self.thread = None
         self.stream = None
-        self.running = threading.Event()  # 👈 Local shutdown control
+        self.running = threading.Event()
 
     def start(self):
         if self.thread and self.thread.is_alive():
@@ -247,7 +240,7 @@ async def mic_stream(page: ft.Page) -> AsyncIterator[str]:
             buf.seek(0)
             buf.name = "speech.wav"
 
-            needed_tokens = 1000  # Rough guess for transcription input
+            needed_tokens = 1000
             wait_s = token_tracker.seconds_until_tokens_available(needed_tokens=needed_tokens)
             if wait_s > 0.0:
                 print(
@@ -258,7 +251,6 @@ async def mic_stream(page: ft.Page) -> AsyncIterator[str]:
             print(f"[tokens] Using {needed_tokens} tokens for transcription (available={token_tracker.tokens_available()})")
             token_tracker.add_tokens(needed_tokens)
 
-            # --- Send transcription request ---
             text_obj = await client.audio.transcriptions.create(
                 model=WHISPER_MODEL,
                 file=buf,
@@ -297,10 +289,8 @@ class Speaker:
         page.update()
 
         try:
-            # --- Estimate tokens needed ---
             needed_tokens = max(50, len(text) // 4)
 
-            # --- Wait if necessary ---
             wait_s = token_tracker.seconds_until_tokens_available(needed_tokens=needed_tokens)
             if wait_s > 0.0:
                 print(
@@ -311,7 +301,6 @@ class Speaker:
             print(f"[tokens] Using {needed_tokens} tokens for speech (available={token_tracker.tokens_available()})")
             token_tracker.add_tokens(needed_tokens)
 
-            # --- Send TTS request ---
             resp = await client.audio.speech.create(
                 model=TTS_MODEL,
                 voice=VOICE_NAME,
@@ -411,14 +400,9 @@ def main(page: ft.Page):
     page.screenshot_buffer = []
 
     end_conversation_button = ft.IconButton(
-        content=ft.Image(
-            src=os.path.join(ASSETS_DIR, "logo.png"),
-            width=50,
-            height=50,
-            fit=ft.ImageFit.CONTAIN,
-        ),
-        tooltip="New conversation",
-        padding=0,
+        content=ft.Text("📝"),
+        tooltip="Start a new conversation",
+        padding=0
     )
 
     speaker = Speaker()
@@ -434,12 +418,65 @@ def main(page: ft.Page):
     }
     context_manager = ContextManager(system_prompt)
 
+    sidebar = ft.Column(spacing=4, width=190)
+    sidebar.visible = False
+
+    def toggle_sidebar():
+        sidebar.visible = not sidebar.visible
+        toggle_sidebar_btn.tooltip = (
+            "Hide history" if sidebar.visible else "Show history"
+        )
+        page.update()
+
+    toggle_sidebar_btn = ft.IconButton(
+        content=ft.Image(
+            src=os.path.join(ASSETS_DIR, "logo.png"),
+            width=32,
+            height=32,
+            fit=ft.ImageFit.CONTAIN,
+        ),
+        tooltip="Show history",
+        on_click=lambda e: toggle_sidebar(),
+        style=ft.ButtonStyle(padding=ft.padding.all(0))
+    )
+
+    def _load_chat(e: ft.ControlEvent):
+        stem = e.control.data
+        do_load_conversation(stem)
+
+    def refresh_sidebar():
+        sidebar.controls.clear()
+
+        sidebar.controls.append(
+            ft.Container(end_conversation_button, padding=0, margin=0, alignment=ft.alignment.center_right)
+        )
+
+        for stem in get_previous_conversation_names():
+            sidebar.controls.append(
+                ft.TextButton(
+                    stem,
+                    data=stem,
+                    on_click=_load_chat,
+                    style=ft.ButtonStyle(padding=ft.padding.symmetric(8, 4)),
+                )
+            )
+        sidebar.update()
+
+    def do_save_conversation(name, is_internal_stem_name: bool = False):
+        if not is_internal_stem_name:
+            name = unique_history_basename(name)
+        context_manager.save_conversation(name)
+        chat.save_view(name)
+
+    def do_load_conversation(stem_name):
+        context_manager.load_conversation(stem_name)
+        chat.load_view(stem_name)
+
     async def send_message(user_text: str):
         if page.thinking_task:
             page.thinking_task.cancel()
             page.thinking_task = None
 
-        chat.cleanup()
         chat.add_user(user_text)
 
         context_manager.add_screenshots(page.screenshot_buffer.copy())
@@ -590,7 +627,7 @@ def main(page: ft.Page):
 
     dlg_end_convo = ft.AlertDialog(
         modal=True,
-        title=ft.Text("Save Chat?"),
+        title=ft.Text("Save Current Chat?"),
         content=conversation_name_field,
         actions_alignment=ft.MainAxisAlignment.END,
     )
@@ -606,12 +643,13 @@ def main(page: ft.Page):
             page.screenshot_buffer.clear()
             context_manager.clear()
 
+        refresh_sidebar()
         dlg_end_convo.open = False
         page.update()
 
     def _save_conversation(e=None):
         name = conversation_name_field.value.strip()
-        context_manager.save_conversation(name)
+        do_save_conversation(name)
         _close_cleanup_end_convo_dlg()
 
     def _end_convo_dlg_key_handler(e: ft.KeyboardEvent):
@@ -644,19 +682,26 @@ def main(page: ft.Page):
 
     screenshot_button.on_click = toggle_screenshots
 
-    page.add(
-        ft.Container(
+    main_col = ft.Column(
+        [
+            chat,
             ft.Row(
-                [end_conversation_button],
-                alignment=ft.MainAxisAlignment.START,
-                spacing=0,
+                [toggle_sidebar_btn, input_field, send_button, speech_button, mic_button, screenshot_button]
             ),
-            padding=0,
-            margin=0,
-        ),
-        chat,
-        ft.Row([input_field, send_button, speech_button, mic_button, screenshot_button]),
+        ],
+        expand=True,
     )
+
+    page.add(
+        ft.Row(
+            [sidebar, main_col],
+            expand=True,
+            vertical_alignment=ft.CrossAxisAlignment.START,
+        )
+    )
+
+    refresh_sidebar()
+    do_load_conversation("__on_close__")
 
     async def mic_listener():
         async for speech in mic_stream(page):
@@ -693,7 +738,7 @@ def main(page: ft.Page):
     async def on_close(e=None):
         print("[shutdown] Cleaning up...")
 
-        context_manager.save_conversation("__on_close__")
+        do_save_conversation("__on_close__", is_internal_stem_name=True)
 
         shutdown_event.set()
 

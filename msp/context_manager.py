@@ -21,25 +21,31 @@ class ContextManager:
         self.history.clear()
         self.all_screenshots.clear()
 
-    def save_conversation(self, conversation_name: str):
-        if not conversation_name:
-            conversation_name = "anonymous"
-        attempt = 0
-        while True:
-            full_name = f"{self._now().strftime('%Y-%m-%d')}:{conversation_name}"
-            if attempt > 0:
-                full_name += f"({attempt})"
-            full_name += ".pkl"
-            if not os.path.exists(os.path.join(PROJECT_DIR, "chat_history", full_name)):
-                break
-            attempt += 1
-        os.makedirs(os.path.join(PROJECT_DIR, "chat_history"), exist_ok=True)
-        save_file = os.path.join(PROJECT_DIR, "chat_history", full_name)
+    def save_conversation(self, stem_name: str):
+        save_file = os.path.join(PROJECT_DIR, "history", "context", f"{stem_name}.pkl")
         with open(save_file, "wb") as f:
             pickle.dump(self, f)
 
-    def load_conversation(self, conversation_name: str):
-        pass
+    def load_conversation(self, stem_name: str) -> bool:
+        file_path = os.path.join(PROJECT_DIR, "history", "context", f"{stem_name}.pkl")
+
+        if not os.path.exists(file_path):
+            print(f"[ContextManager.load_conversation] Not found: {file_path}")
+            return False
+
+        try:
+            with open(file_path, "rb") as f:
+                loaded = pickle.load(f)
+        except Exception as e:
+            print(f"[ContextManager.load_conversation] Error reading {file_path}: {e}")
+            return False
+
+        if not isinstance(loaded, ContextManager):
+            print(f"[ContextManager.load_conversation] File does not contain a ContextManager object")
+            return False
+
+        self.__dict__.update(loaded.__dict__)
+        return True
 
     def add_screenshots(self, screenshots: List[bytes]) -> None:
         self.all_screenshots.append(screenshots)
