@@ -72,11 +72,43 @@ class ChatView(ft.Column):
         return b
 
     def finish_ai(self, bubble: ChatBubble):
+        raw_text = bubble.text.value
+        parts = self._split_text(raw_text)
+
+        bubble.update_text(parts[0], italic=False, color=ChatBubble.PALETTE["assistant"][0])
         bubble.data["temporary"] = False
-        bubble.text.italic = False
-        bubble.text.color = ChatBubble.PALETTE["assistant"][0]
+
+        for i, part in enumerate(parts[1:], start=1):
+            new_bubble = ChatBubble(part, sender="assistant", temporary=False, identifier=self._next_key("assistant"))
+            self._col.controls.insert(self._col.controls.index(bubble) + i, new_bubble)
+
         if self.page:
             self.page.update()
+
+    def _split_text(self, text: str) -> list[str]:
+        lines = text.splitlines()
+        parts = []
+        current = []
+        in_code_block = False
+
+        for line in lines:
+            stripped = line.strip()
+
+            if stripped.startswith("```"):
+                in_code_block = not in_code_block
+                current.append(line)
+                continue
+
+            if not in_code_block and stripped.startswith("#") and current:
+                parts.append("\n".join(current).strip())
+                current = [line]
+            else:
+                current.append(line)
+
+        if current:
+            parts.append("\n".join(current).strip())
+
+        return [p for p in parts if p]
 
     def clear(self):
         self._col.controls.clear()
