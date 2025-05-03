@@ -726,7 +726,7 @@ def main(page: ft.Page):
         nonlocal current_stem, _prev_key_handler
         print("[end_conversation] Ending conversation…")
 
-        if current_stem is None or current_stem.startswith("__"):
+        if (current_stem is None or current_stem.startswith("__")) and not chat.is_empty():
             conversation_name_field.value = ""
             dlg_end_convo.open = True
             _prev_key_handler = page.on_keyboard_event

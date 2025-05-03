@@ -83,6 +83,9 @@ class ChatView(ft.Column):
         if self.page:
             self.page.update()
 
+    def is_empty(self) -> bool:
+        return not self._col.controls
+
     def scroll_to_bubble(self, idx: int):
         if 0 <= idx < len(self._col.controls):
             ctrl = self._col.controls[idx]
