@@ -1,8 +1,10 @@
+import os
 from datetime import datetime, timedelta
 from typing import Optional, List
+import pickle
 
 from msp.ocr_screenshot import extract_code_text
-from msp.settings import MAX_HISTORY_MESSAGES, MAX_HISTORY_AGE_S, NUM_LATEST_SCREENSHOTS
+from msp.settings import MAX_HISTORY_MESSAGES, MAX_HISTORY_AGE_S, NUM_LATEST_SCREENSHOTS, PROJECT_DIR
 from msp.token_cost_estimate import estimate_message_tokens
 
 
@@ -10,13 +12,34 @@ class ContextManager:
     def __init__(self, system_prompt: dict):
         self.system_prompt = system_prompt
         self.history: List[dict] = []
-        self.latest_screenshots: List[bytes] = []
+        self.all_screenshots: List[List[bytes]] = []
 
     def _now(self) -> datetime:
         return datetime.now()
 
-    def set_latest_screenshots(self, screenshots: List[bytes]) -> None:
-        self.latest_screenshots = screenshots
+    def clear(self):
+        self.history.clear()
+        self.all_screenshots.clear()
+
+    def save_conversation(self, conversation_name: str):
+        if not conversation_name:
+            conversation_name = "anonymous"
+        attempt = 0
+        while True:
+            full_name = f"{self._now().strftime('%Y-%m-%d')}:{conversation_name}"
+            if attempt > 0:
+                full_name += f"({attempt})"
+            full_name += ".pkl"
+            if not os.path.exists(os.path.join(PROJECT_DIR, "chat_history", full_name)):
+                break
+            attempt += 1
+        os.makedirs(os.path.join(PROJECT_DIR, "chat_history"), exist_ok=True)
+        save_file = os.path.join(PROJECT_DIR, "chat_history", full_name)
+        with open(save_file, "wb") as f:
+            pickle.dump(self, f)
+
+    def add_screenshots(self, screenshots: List[bytes]) -> None:
+        self.all_screenshots.append(screenshots)
 
     def add_user_message(self, text: str) -> None:
         self.history.append({
@@ -49,8 +72,8 @@ class ContextManager:
                 "content": [{"type": "text", "text": text_content}]
             })
 
-            if i == 0 and role == "user" and self.latest_screenshots:
-                for png in self.latest_screenshots[-NUM_LATEST_SCREENSHOTS:]:
+            if i == 0 and role == "user" and self.all_screenshots and self.all_screenshots[-1]:
+                for png in self.all_screenshots[-1][-NUM_LATEST_SCREENSHOTS:]:
                     code_block = extract_code_text(png)
                     assembled.append({
                         "role": role,
@@ -58,8 +81,6 @@ class ContextManager:
                     })
 
         full_context = context + list(reversed(assembled))
-
-        self.latest_screenshots = []  # Clear after building
         return full_context
 
     def estimate_total_tokens(self, now: Optional[datetime] = None) -> int:

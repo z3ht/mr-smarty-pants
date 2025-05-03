@@ -18,7 +18,7 @@ from openai import AsyncOpenAI
 from skimage.metrics import structural_similarity as ssim
 
 from msp.settings import OPENAI_API_KEY, TOKEN_LIMIT_PER_M, WINDOW_NAME, AUDIO_CHUNK_S, WHISPER_MODEL, VOICE_NAME, \
-    TTS_MODEL, ASSETS_DIR, CHAT_MODEL, SCREENSHOT_INTERVAL_S, SCREENSHOT_SIMILARITY_THRESHOLD_PCT
+    TTS_MODEL, ASSETS_DIR, CHAT_MODEL, SCREENSHOT_INTERVAL_S, SCREENSHOT_SIMILARITY_THRESHOLD_PCT, PROJECT_DIR
 from msp.context_manager import ContextManager
 from msp.token_cost_estimate import estimate_message_tokens
 
@@ -467,7 +467,7 @@ def main(page: ft.Page):
         )
         page.update()
 
-        context_manager.set_latest_screenshots(page.screenshot_buffer.copy())
+        context_manager.add_screenshots(page.screenshot_buffer.copy())
         page.screenshot_buffer.clear()
 
         context_manager.add_user_message(user_text)
@@ -659,14 +659,60 @@ def main(page: ft.Page):
         mic_button.update()
         page.update()
 
-    def end_conversation(e=None):
-        print("[end_conversation] Ending conversation...")
+    conversation_name_field = ft.TextField(
+        autofocus=True,
+        width=350,
+    )
 
-        chat.controls.clear()
-        context_manager.history.clear()
-        page.screenshot_buffer.clear()
+    dlg_end_convo = ft.AlertDialog(
+        modal=True,
+        title=ft.Text("Name:"),
+        content=conversation_name_field,
+        actions_alignment=ft.MainAxisAlignment.END,
+    )
+    page.overlay.append(dlg_end_convo)
+
+    _prev_key_handler = page.on_keyboard_event
+
+    def _close_cleanup_end_convo_dlg(e=None, clear_chat=True):
+        dlg_end_convo.open = False
+        page.on_keyboard_event = _prev_key_handler
+
+        if clear_chat:
+            chat.controls.clear()
+            page.screenshot_buffer.clear()
+            context_manager.clear()
 
         page.update()
+
+    def _save_conversation(e=None):
+        name = conversation_name_field.value.strip()
+        context_manager.save_conversation(name)
+        _close_cleanup_end_convo_dlg()
+
+    def _end_convo_dlg_key_handler(e: ft.KeyboardEvent):
+        if not dlg_end_convo.open:
+            return
+
+        if e.key == "Escape":
+            _close_cleanup_end_convo_dlg(clear_chat=False)
+        elif e.key == "Enter" and not (e.alt or e.ctrl or e.shift):
+            _save_conversation()
+
+    dlg_end_convo.actions = [
+        ft.TextButton("Cancel", on_click=lambda e: _close_cleanup_end_convo_dlg(e, clear_chat=False)),
+        ft.TextButton("Wipe", on_click=_close_cleanup_end_convo_dlg),
+        ft.ElevatedButton("Save", on_click=_save_conversation),
+    ]
+
+    def end_conversation(e=None):
+        print("[end_conversation] Ending conversation...")
+        conversation_name_field.value = ""
+        dlg_end_convo.open = True
+        page.on_keyboard_event = _end_convo_dlg_key_handler
+        page.update()
+
+    end_conversation_button.on_click = end_conversation
 
     send_button.on_click = handle_send_button
     input_field.on_submit = handle_send
@@ -725,6 +771,8 @@ def main(page: ft.Page):
     async def on_close(e=None):
         print("[shutdown] Cleaning up...")
 
+        end_conversation()
+
         shutdown_event.set()
 
         await speaker.stop()
@@ -753,4 +801,4 @@ def main(page: ft.Page):
     page.on_close = on_close
 
 
-ft.app(target=main, assets_dir="../assets")
+ft.app(target=main, assets_dir=os.path.join(PROJECT_DIR, "assets"))
