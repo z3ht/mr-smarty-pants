@@ -21,6 +21,7 @@ from msp.settings import OPENAI_API_KEY, TOKEN_LIMIT_PER_M, WINDOW_NAME, AUDIO_C
     TTS_MODEL, ASSETS_DIR, CHAT_MODEL, SCREENSHOT_INTERVAL_S, SCREENSHOT_SIMILARITY_THRESHOLD_PCT, PROJECT_DIR
 from msp.context_manager import ContextManager
 from msp.token_cost_estimate import estimate_message_tokens
+from msp.chat_view import ChatView, ChatBubble
 
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
@@ -387,7 +388,7 @@ def main(page: ft.Page):
     page.title = "Mr. Smarty Pants Assistant"
     page.vertical_alignment = "start"
 
-    chat = ft.ListView(expand=True, spacing=10, auto_scroll=True)
+    chat = ChatView(expand=True)
 
     input_field = ft.TextField(
         label="Type your message…",
@@ -399,34 +400,25 @@ def main(page: ft.Page):
     )
     send_button = ft.ElevatedButton("Send")
 
-    speech_button = ft.IconButton(
-        content=ft.Text("🔇"),
-        tooltip="Toggle speech (TTS)"
-    )
+    speech_button = ft.IconButton(content=ft.Text("🔇"), tooltip="Toggle speech (TTS)")
     page.speech_enabled = False
 
-    mic_button = ft.IconButton(
-        content=ft.Text("🎙️"),
-        tooltip="Toggle microphone (STT)"
-    )
+    mic_button = ft.IconButton(content=ft.Text("🎙️"), tooltip="Toggle microphone (STT)")
     page.mic_enabled = False
 
-    screenshot_button = ft.IconButton(
-        content=ft.Text("📷"),
-        tooltip="Toggle screenshots",
-    )
+    screenshot_button = ft.IconButton(content=ft.Text("📷"), tooltip="Toggle screenshots")
     page.include_screenshots = False
     page.screenshot_buffer = []
 
     end_conversation_button = ft.IconButton(
-            content=ft.Image(
+        content=ft.Image(
             src=os.path.join(ASSETS_DIR, "logo.png"),
             width=50,
             height=50,
             fit=ft.ImageFit.CONTAIN,
         ),
         tooltip="New conversation",
-        padding=0
+        padding=0,
     )
 
     speaker = Speaker()
@@ -438,33 +430,17 @@ def main(page: ft.Page):
         "content": (
             "You are Mr. Smarty Pants, an AI assistant. Speak clearly, stay concise, "
             "and format code examples inside triple backticks."
-        )
+        ),
     }
     context_manager = ContextManager(system_prompt)
 
     async def send_message(user_text: str):
         if page.thinking_task:
-            try:
-                page.thinking_task.cancel()
-            except Exception as e:
-                print(f"[error] cancelling previous thinking task: {e}")
+            page.thinking_task.cancel()
             page.thinking_task = None
 
-        chat.controls = [
-            c for c in chat.controls[-10:]
-            if not (isinstance(c, ft.Container) and isinstance(c.data, dict) and c.data.get("temporary"))
-        ]
-        page.update()
-
-        chat.controls.append(
-            ft.Container(
-                content=ft.Text(value=f'{user_text}', selectable=True, color="#888888"),
-                padding=2,
-                alignment=ft.alignment.center_left,
-                expand=True,
-            )
-        )
-        page.update()
+        chat.cleanup()
+        chat.add_user(user_text)
 
         context_manager.add_screenshots(page.screenshot_buffer.copy())
         page.screenshot_buffer.clear()
@@ -473,70 +449,42 @@ def main(page: ft.Page):
         full_context = context_manager.build_context()
         needed_tokens = sum(estimate_message_tokens(m) for m in full_context)
 
-        thinking_text = ft.Text("Thinking...", italic=True, selectable=True, color="#888888")
-        thinking_bubble = ft.Container(
-            content=thinking_text,
-            padding=2,
-            alignment=ft.alignment.center_left,
-            data={"temporary": True}
-        )
-        chat.controls.append(thinking_bubble)
-        page.update()
+        thinking_bubble: ChatBubble = chat.start_thinking()
+        thinking_text = thinking_bubble.text
 
-        async def show_thinking_status(waiting_for_tokens: bool, needed_tokens: int):
-            if waiting_for_tokens:
+        async def show_thinking_status(waiting: bool):
+            if waiting:
                 while True:
-                    waiting_s = int(token_tracker.seconds_until_tokens_available(needed_tokens))
-                    if waiting_s <= 0:
+                    wait_s = int(
+                        token_tracker.seconds_until_tokens_available(needed_tokens)
+                    )
+                    if wait_s <= 0:
                         break
-                    thinking_text.value = f"Waiting for tokens... ({waiting_s}s)"
+                    thinking_text.value = f"Waiting for tokens… ({wait_s}s)"
                     page.update()
                     await asyncio.sleep(0.5)
-                thinking_text.value = "Generating response..."
-                page.update()
-            else:
-                await asyncio.sleep(0.5)
-                thinking_text.value = "Generating response..."
-                page.update()
+            await asyncio.sleep(0.5)
+            thinking_text.value = "Generating response…"
+            page.update()
 
         wait_s = token_tracker.seconds_until_tokens_available(needed_tokens)
-        waiting_for_tokens = wait_s > 0.0
-        page.thinking_task = asyncio.create_task(show_thinking_status(waiting_for_tokens, needed_tokens))
+        page.thinking_task = asyncio.create_task(show_thinking_status(wait_s > 0))
 
-        if waiting_for_tokens:
-            print(f"[tokens] Waiting {wait_s:.2f}s (needed={needed_tokens})")
+        if wait_s:
             await asyncio.sleep(wait_s)
-        else:
-            print(f"[tokens] Using {needed_tokens} tokens")
-
         token_tracker.add_tokens(needed_tokens)
 
         try:
             stream = await client.chat.completions.create(
-                model=CHAT_MODEL,
-                messages=full_context,
-                stream=True,
+                model=CHAT_MODEL, messages=full_context, stream=True
             )
-
+        finally:
             if page.thinking_task:
-                try:
-                    page.thinking_task.cancel()
-                except Exception as e:
-                    print(f"[error] cancelling thinking task after wait: {e}")
+                page.thinking_task.cancel()
                 page.thinking_task = None
-
-        except Exception as e:
-            thinking_text.value = f"Error: {e}"
-            thinking_text.color = ft.Colors.RED
-            if isinstance(thinking_text.parent, ft.Container):
-                if isinstance(thinking_text.parent.data, dict):
-                    thinking_text.parent.data["temporary"] = False
-            page.update()
-            return
 
         full_reply = ""
         first_chunk = True
-        ai_message = None
 
         async for delta in stream:
             part = delta.choices[0].delta.content or ""
@@ -545,57 +493,45 @@ def main(page: ft.Page):
             full_reply += part
 
             if first_chunk:
-                ai_message = thinking_text
-                ai_message.value = part.strip()
-                ai_message.italic = False
-                ai_message.color = "#FFFFFF"
-
-                if isinstance(ai_message.parent, ft.Container):
-                    if isinstance(ai_message.parent.data, dict):
-                        ai_message.parent.data["temporary"] = False
-
-                page.update()
+                thinking_bubble.update_text(part.strip(), italic=False, color="#FFFFFF")
+                thinking_bubble.data["temporary"] = False
                 first_chunk = False
             else:
-                ai_message.value = full_reply
-                page.update()
+                thinking_bubble.update_text(full_reply)
+            page.update()
 
         full_reply = full_reply.strip()
+        chat.finish_ai(thinking_bubble)   # mark as final (no italics)
 
         if full_reply:
             if len(full_reply) <= 100:
                 await speaker.speak(full_reply, send_button, page)
             else:
-                wait_s = token_tracker.seconds_until_tokens_available(needed_tokens=500)
-                if wait_s > 0.0:
-                    print(f"[tokens] Waiting {wait_s:.2f}s before summarizing")
-                    await asyncio.sleep(wait_s)
-
-                print(f"[tokens] Using 500 tokens for summarizing")
-                token_tracker.add_tokens(500)
-
-                try:
-                    summary_resp = await client.chat.completions.create(
-                        model=CHAT_MODEL,
-                        messages=[
-                            {"role": "system",
-                             "content": "Summarize the following text into a single concise sentence for speaking aloud."},
-                            {"role": "user", "content": full_reply}
-                        ]
-                    )
-                    summary_text = summary_resp.choices[0].message.content.strip()
-                    if summary_text:
-                        print(f"[summary] {summary_text}")
-                        await speaker.speak(summary_text, send_button, page)
-                    else:
-                        print("[summary] No summary generated")
-                except Exception as e:
-                    print(f"[summary error] {e}")
+                await _speak_summary(full_reply)
 
             context_manager.add_assistant_message(full_reply)
 
-    async def handle_send(e=None):
-        print("[handle_send] send triggered")
+    async def _speak_summary(text: str):
+        wait_s = token_tracker.seconds_until_tokens_available(needed_tokens=500)
+        if wait_s:
+            await asyncio.sleep(wait_s)
+        token_tracker.add_tokens(500)
+
+        summary_resp = await client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Summarize the text into a single concise sentence for speaking aloud.",
+                },
+                {"role": "user", "content": text},
+            ],
+        )
+        summary = summary_resp.choices[0].message.content.strip()
+        if summary:
+            await speaker.speak(summary, send_button, page)
+
+    async def handle_send(_=None):
         user_text = input_field.value.strip()
         if not user_text:
             return
@@ -603,28 +539,14 @@ def main(page: ft.Page):
         page.update()
 
         if page.send_task and not page.send_task.done():
-            try:
-                print("[handle_send] Cancelling previous send task")
-                page.send_task.cancel()
-            except Exception as e:
-                print(f"[error] problem cancelling previous send task: {e}")
-
-        if page.thinking_task:
-            try:
-                page.thinking_task.cancel()
-                print("[cancel] Previous thinking_task canceled.")
-            except Exception as e:
-                print(f"[error] cancelling previous thinking task: {e}")
-            page.thinking_task = None
-
+            page.send_task.cancel()
         page.send_task = asyncio.create_task(send_message(user_text))
 
-    async def handle_send_button(e=None):
+    async def handle_send_button(_=None):
         if speaker.speaking:
-            print("[handle_send_button] Stopping speech instead of sending message")
             await speaker.stop()
         else:
-            await handle_send(e)
+            await handle_send()
 
     def toggle_speech(e=None):
         page.speech_enabled = not page.speech_enabled
@@ -641,7 +563,9 @@ def main(page: ft.Page):
     def toggle_screenshots(e=None):
         page.include_screenshots = not page.include_screenshots
         screenshot_button.content.value = "📸" if page.include_screenshots else "📷"
-        screenshot_button.content.tooltip = "Taking screenshots" if page.include_screenshots else "Screenshots disabled"
+        screenshot_button.tooltip = (
+            "Taking screenshots" if page.include_screenshots else "Screenshots disabled"
+        )
         screenshot_button.update()
         print(f"[toggle_screenshots] Screenshots {'enabled' if page.include_screenshots else 'disabled'}.")
 
@@ -678,7 +602,7 @@ def main(page: ft.Page):
         page.on_keyboard_event = _prev_key_handler
 
         if clear_chat:
-            chat.controls.clear()
+            chat.clear()
             page.screenshot_buffer.clear()
             context_manager.clear()
 
@@ -711,8 +635,6 @@ def main(page: ft.Page):
         dlg_end_convo.open = True
         page.on_keyboard_event = _end_convo_dlg_key_handler
         page.update()
-
-    end_conversation_button.on_click = end_conversation
 
     send_button.on_click = handle_send_button
     input_field.on_submit = handle_send

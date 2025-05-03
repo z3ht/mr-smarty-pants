@@ -38,6 +38,9 @@ class ContextManager:
         with open(save_file, "wb") as f:
             pickle.dump(self, f)
 
+    def load_conversation(self, conversation_name: str):
+        pass
+
     def add_screenshots(self, screenshots: List[bytes]) -> None:
         self.all_screenshots.append(screenshots)
 
