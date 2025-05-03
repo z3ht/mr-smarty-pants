@@ -375,13 +375,13 @@ class Speaker:
 
 
 def main(page: ft.Page):
-    page.title = "Mr. Smarty Pants Assistant"
+    page.title = "Mr. Smarty Pants"
     page.vertical_alignment = "start"
 
     chat = ChatView(expand=True)
 
     input_field = ft.TextField(
-        label="Type your message…",
+        label="Type…",
         expand=True,
         multiline=True,
         min_lines=1,
@@ -444,6 +444,25 @@ def main(page: ft.Page):
         style=ft.ButtonStyle(padding=ft.padding.all(0)),
     )
 
+    end_conversation_button = ft.IconButton(
+        content=ft.Text("📝"),
+        tooltip="Start a new conversation",
+        padding=0
+    )
+
+    def toggle_search():
+        if search_bar.visible:
+            search_bar.close()
+        else:
+            search_bar.open()
+
+    search_toggle_btn = ft.IconButton(
+        content=ft.Text("🔍"),
+        tooltip="Search chat (Ctrl/⌘ + F)",
+        on_click=lambda e: toggle_search(),
+        style=ft.ButtonStyle(padding=ft.padding.all(0)),
+    )
+
     def do_save_conversation(name: str, *, is_internal_stem_name: bool = False) -> str:
         nonlocal current_stem
         if not is_internal_stem_name:
@@ -461,9 +480,20 @@ def main(page: ft.Page):
 
     def refresh_sidebar():
         sidebar.controls.clear()
-        sidebar.controls.append(
-            ft.Container(end_conversation_button, padding=0, margin=0, alignment=ft.alignment.center_right)
+
+        top_buttons = ft.Row(
+            [
+                search_toggle_btn,
+                end_conversation_button,
+            ],
+            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            spacing=8,
         )
+
+        sidebar.controls.append(
+            ft.Container(top_buttons, padding=0, margin=0, alignment=ft.alignment.center_right)
+        )
+
         for stem in get_previous_conversation_names():
             sidebar.controls.append(
                 ft.TextButton(
@@ -473,6 +503,7 @@ def main(page: ft.Page):
                     style=ft.ButtonStyle(padding=ft.padding.symmetric(8, 4)),
                 )
             )
+
         sidebar.update()
 
     def _load_chat(e: ft.ControlEvent):
@@ -648,8 +679,10 @@ def main(page: ft.Page):
     _prev_key_handler = page.on_keyboard_event
 
     def _close_cleanup_end_convo_dlg(e=None, *, clear_chat: bool = True):
-        nonlocal current_stem, pending_load_stem
-        page.on_keyboard_event = _prev_key_handler
+        nonlocal _prev_key_handler, current_stem, pending_load_stem
+        if _prev_key_handler:
+            page.on_keyboard_event = _prev_key_handler
+            _prev_key_handler = None
 
         if clear_chat:
             chat.clear()
@@ -690,12 +723,13 @@ def main(page: ft.Page):
     ]
 
     def end_conversation(e=None):
-        nonlocal current_stem
+        nonlocal current_stem, _prev_key_handler
         print("[end_conversation] Ending conversation…")
 
         if current_stem is None or current_stem.startswith("__"):
             conversation_name_field.value = ""
             dlg_end_convo.open = True
+            _prev_key_handler = page.on_keyboard_event
             page.on_keyboard_event = _end_convo_dlg_key_handler
             page.update()
             return
@@ -704,11 +738,8 @@ def main(page: ft.Page):
         _close_cleanup_end_convo_dlg()
 
     def _page_key_handler(e: ft.KeyboardEvent):
-        if (e.key.lower() == "f" and e.ctrl) or (e.key.lower() == "f" and e.meta):
-            if search_bar.visible:
-                search_bar.close()
-            else:
-                search_bar.open()
+        if e.key.lower() == "f" and (e.ctrl or e.meta):
+            toggle_search()
 
     page.on_keyboard_event = _page_key_handler
 
@@ -722,11 +753,11 @@ def main(page: ft.Page):
 
     main_col = ft.Column(
         [
-            chat,
             search_bar,
+            chat,
             ft.Row(
-                [toggle_sidebar_btn, input_field, send_button, speech_button, mic_button, screenshot_button]
-            ),
+                controls=[toggle_sidebar_btn, input_field, send_button, speech_button, mic_button, screenshot_button]
+            )
         ],
         expand=True,
     )
