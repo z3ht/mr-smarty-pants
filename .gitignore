@@ -1,3 +1,4 @@
 .env
 /venv/
 /screenshots/
+/chat_history/

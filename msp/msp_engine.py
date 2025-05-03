@@ -1,4 +1,3 @@
-import argparse
 import io
 import os
 import threading
@@ -6,7 +5,7 @@ import asyncio
 from collections import deque
 from datetime import datetime, timedelta
 from queue import Queue, Empty
-from typing import AsyncIterator, Optional, List
+from typing import AsyncIterator
 
 import flet as ft
 import numpy as np
@@ -14,77 +13,18 @@ import pywinctl as pwc
 import sounddevice as sd
 import soundfile as sf
 from PIL import Image
-from dotenv import load_dotenv
 from mss import mss
 from openai import AsyncOpenAI
 from skimage.metrics import structural_similarity as ssim
-import tiktoken
 
-from msp.ocr_screenshot import extract_code_text
-
-# --- Parse Arguments ---
-parser = argparse.ArgumentParser(description="Run Mr. Smarty Pants")
-parser.add_argument("--window", type=str, help="Fuzzy match window title to capture")
-args = parser.parse_args()
-
-WINDOW_NAME = args.window if args.window else None
+from msp.settings import OPENAI_API_KEY, TOKEN_LIMIT_PER_M, WINDOW_NAME, AUDIO_CHUNK_S, WHISPER_MODEL, VOICE_NAME, \
+    TTS_MODEL, ASSETS_DIR, CHAT_MODEL, SCREENSHOT_INTERVAL_S, SCREENSHOT_SIMILARITY_THRESHOLD_PCT
+from msp.context_manager import ContextManager
+from msp.token_cost_estimate import estimate_message_tokens
 
 
-# --- Setup environment ---
-load_dotenv()
-ASSETS_DIR = os.path.join(os.path.dirname(__file__), "assets")
-
-API_KEY = os.getenv("OPENAI_API_KEY")
-if not API_KEY:
-    raise SystemExit("Missing OPENAI_API_KEY; set it in .env file")
-
-AUDIO_CHUNK_S = int(os.getenv("AUDIO_CHUNK_S", "3"))
-VOICE_NAME = os.getenv("VOICE_NAME", "onyx")
-CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
-TTS_MODEL = os.getenv("TTS_MODEL", "gpt-4o-mini-tts")
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1")
-SCREENSHOT_INTERVAL_S = float(os.getenv("SCREENSHOT_INTERVAL_S", "0.1"))
-MOTION_THRESHOLD = float(os.getenv("MOTION_THRESHOLD", "500"))
-SCREENSHOT_SIMILARITY_THRESHOLD_PCT = float(os.getenv("SCREENSHOT_SIMILARITY_THRESHOLD_PCT", "0.95"))
-MAX_SCREENSHOT_AGE_S = int(os.getenv("MAX_SCREENSHOT_AGE_S", "30"))
-MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "10"))
-MAX_HISTORY_AGE_S = int(os.getenv("MAX_HISTORY_AGE_S", "300"))
-NUM_LATEST_SCREENSHOTS = int(os.getenv("NUM_LATEST_SCREENSHOTS", "1"))
-TOKEN_LIMIT_PER_M = int(os.getenv("TOKEN_LIMIT_PER_M", "200_000"))
-
-client = AsyncOpenAI(api_key=API_KEY)
-
-# --- Global shutdown event ---
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 shutdown_event = threading.Event()
-
-
-def count_tokens(text: str) -> int:
-    encoding = tiktoken.encoding_for_model(CHAT_MODEL)
-    tokens = encoding.encode(text)
-    return len(tokens)
-
-
-def estimate_message_tokens(message: dict) -> int:
-    content = message.get("content")
-    total_tokens = 0
-
-    if isinstance(content, list):
-        for part in content:
-            if part.get("type") == "text":
-                total_tokens += count_tokens(part.get("text", ""))
-            elif part.get("type") == "image_url":
-                url = part.get("image_url", {}).get("url", "")
-                if url.startswith("data:image/"):
-                    base64_data = url.split(",", 1)[-1]
-                    byte_length = (len(base64_data) * 3) // 4
-                    estimated_tokens = max(1, byte_length // 4)
-                    total_tokens += estimated_tokens
-    elif isinstance(content, str):
-        total_tokens += count_tokens(content)
-
-    total_tokens += 3  # small constant overhead per message
-
-    return total_tokens
 
 
 class TokenUsageTracker:
@@ -154,66 +94,6 @@ class TokenUsageTracker:
 
 
 token_tracker = TokenUsageTracker()
-
-
-class ContextManager:
-    def __init__(self, system_prompt: dict):
-        self.system_prompt = system_prompt
-        self.history: List[dict] = []
-        self.latest_screenshots: List[bytes] = []
-
-    def _now(self) -> datetime:
-        return datetime.now()
-
-    def set_latest_screenshots(self, screenshots: List[bytes]) -> None:
-        self.latest_screenshots = screenshots
-
-    def add_user_message(self, text: str) -> None:
-        self.history.append({
-            "role": "user",
-            "content": text,
-            "timestamp": self._now()
-        })
-
-    def add_assistant_message(self, text: str) -> None:
-        self.history.append({
-            "role": "assistant",
-            "content": text,
-            "timestamp": self._now()
-        })
-
-    def build_context(self, now: Optional[datetime] = None) -> List[dict]:
-        now = now or self._now()
-        cutoff = now - timedelta(seconds=MAX_HISTORY_AGE_S)
-        recent = [m for m in self.history if m.get("timestamp", now) >= cutoff]
-
-        context = [self.system_prompt]
-        assembled = []
-
-        for i, message in enumerate(reversed(recent[-MAX_HISTORY_MESSAGES:])):
-            role = message["role"]
-            text_content = message["content"]
-
-            assembled.append({
-                "role": role,
-                "content": [{"type": "text", "text": text_content}]
-            })
-
-            if i == 0 and role == "user" and self.latest_screenshots:
-                for png in self.latest_screenshots[-NUM_LATEST_SCREENSHOTS:]:
-                    code_block = extract_code_text(png)
-                    assembled.append({
-                        "role": role,
-                        "content": [{"type": "text", "text": code_block}]
-                    })
-
-        full_context = context + list(reversed(assembled))
-
-        self.latest_screenshots = []  # Clear after building
-        return full_context
-
-    def estimate_total_tokens(self, now: Optional[datetime] = None) -> int:
-        return sum(estimate_message_tokens(m) for m in self.build_context(now))
 
 
 _last_selected = None
@@ -873,4 +753,4 @@ def main(page: ft.Page):
     page.on_close = on_close
 
 
-ft.app(target=main, assets_dir="assets")
+ft.app(target=main, assets_dir="../assets")
