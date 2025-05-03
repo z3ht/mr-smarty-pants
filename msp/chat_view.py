@@ -42,22 +42,30 @@ class ChatView(ft.Column):
     def __init__(self, *, expand: bool = True):
         super().__init__(spacing=0, expand=expand)
 
-        self._col = ft.Column(spacing=10, expand=True)
+        self._col = ft.Column(
+            spacing=10,
+            scroll=ft.ScrollMode.AUTO,
+            expand=True
+        )
         self._scrollable = ft.Container(
             content=self._col,
             expand=True,
+            clip_behavior=ft.ClipBehavior.ANTI_ALIAS
         )
         self.controls.append(self._scrollable)
 
+    def _next_key(self, sender: str) -> str:
+        return f"{sender}-{len(self._col.controls)}"
+
     def add_user(self, text: str) -> ChatBubble:
-        b = ChatBubble(text, sender="user", identifier=f"user-{len(self._col.controls)}")
+        b = ChatBubble(text, sender="user", identifier=self._next_key("user"))
         self._col.controls.append(b)
         if self.page:
             self.page.update()
         return b
 
     def start_ai(self) -> ChatBubble:
-        b = ChatBubble("Thinking…", sender="assistant", temporary=True, identifier=f"ai-{len(self._col.controls)}")
+        b = ChatBubble("Thinking…", sender="assistant", temporary=True, identifier=self._next_key("ai"))
         self._col.controls.append(b)
         if self.page:
             self.page.update()
@@ -137,10 +145,11 @@ class ChatView(ft.Column):
             return False
 
         self.clear()
-        for entry in export:
+        for i, entry in enumerate(export):
             sender = entry.get("sender") or "assistant"
             text = entry.get("text", "")
-            bubble = ChatBubble(text, sender=sender, temporary=False)
+            key = f"{sender}-{i}"
+            bubble = ChatBubble(text, sender=sender, temporary=False, identifier=key)
             self._col.controls.append(bubble)
 
         if self.page:
