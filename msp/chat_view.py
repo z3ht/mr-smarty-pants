@@ -50,14 +50,14 @@ class ChatView(ft.Column):
         self.controls.append(self._scrollable)
 
     def add_user(self, text: str) -> ChatBubble:
-        b = ChatBubble(text, sender="user", identifier=f"bubble-{len(self._col.controls)}")
+        b = ChatBubble(text, sender="user", identifier=f"user-{len(self._col.controls)}")
         self._col.controls.append(b)
         if self.page:
             self.page.update()
         return b
 
     def start_ai(self) -> ChatBubble:
-        b = ChatBubble("Thinking…", sender="assistant", temporary=True, identifier=f"bubble-{len(self._col.controls)}")
+        b = ChatBubble("Thinking…", sender="assistant", temporary=True, identifier=f"ai-{len(self._col.controls)}")
         self._col.controls.append(b)
         if self.page:
             self.page.update()
