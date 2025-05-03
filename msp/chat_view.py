@@ -10,7 +10,7 @@ from msp.settings import PROJECT_DIR
 
 class ChatBubble(ft.Container):
     PALETTE = {
-        "user": ("#888888", ft.alignment.center_left),
+        "user": ("#CCCCCC", ft.alignment.center_left),
         "assistant": ("#FFFFFF", ft.alignment.center_left),
         "system": ("#FF9800", ft.alignment.center_left),
     }
