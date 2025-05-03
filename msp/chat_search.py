@@ -24,13 +24,22 @@ class SearchBar(ft.Row):
             on_submit=lambda _: self._run_search(),
             on_change=lambda _: self._run_search(live=True),
         )
+        self.result_label = ft.Text(value="", width=70, text_align=ft.TextAlign.CENTER)
+
         self.prev_btn = ft.IconButton(content=ft.Text("⬆"), tooltip="Previous match", on_click=self._prev)
         self.next_btn = ft.IconButton(content=ft.Text("⬇"), tooltip="Next match", on_click=self._next)
         self.close_btn = ft.IconButton(content=ft.Text("❌"), tooltip="Close search", on_click=self.close)
 
-        self.controls.extend([self.search_field, self.prev_btn, self.next_btn, self.close_btn])
+        self.controls.extend([
+            self.search_field,
+            self.result_label,
+            self.prev_btn,
+            self.next_btn,
+            self.close_btn
+        ])
+
         self._prev_key_handler: typing.Optional[typing.Callable[[ft.KeyboardEvent], None]] = None
-        self._update_nav_buttons(disable=True)
+        self._update_ui()
 
     def open(self):
         if not self.visible:
@@ -45,20 +54,24 @@ class SearchBar(ft.Row):
         self._idx = -1
         self.visible = False
         self.search_field.value = ""
+        self.result_label.value = ""
         self._release_keys()
         self.page.update()
 
     def _run_search(self, *, live: bool = False):
         query = self.search_field.value.strip()
         if not query:
-            self._update_nav_buttons(disable=True)
+            self._matches.clear()
+            self._idx = -1
             self.chat.highlight(-1)
+            self._update_ui()
             return
 
         self._matches = self.chat.search(query)
         if not self._matches:
-            self._update_nav_buttons(disable=True)
+            self._idx = -1
             self.chat.highlight(-1)
+            self._update_ui(no_matches=True)
             return
 
         self._idx = 0 if live or self._idx < 0 else self._idx
@@ -69,7 +82,7 @@ class SearchBar(ft.Row):
             return
         self._idx %= len(self._matches)
         self.chat.highlight(self._matches[self._idx], auto_scroll=True)
-        self._update_nav_buttons(disable=False)
+        self._update_ui()
 
     def _next(self, *_):
         if self._matches:
@@ -81,8 +94,17 @@ class SearchBar(ft.Row):
             self._idx = (self._idx - 1) % len(self._matches)
             self._jump()
 
-    def _update_nav_buttons(self, *, disable: bool):
-        self.prev_btn.disabled = self.next_btn.disabled = disable
+    def _update_ui(self, *, no_matches: bool = False):
+        if no_matches:
+            self.result_label.value = "0 results"
+            self.prev_btn.disabled = self.next_btn.disabled = True
+        elif self._matches:
+            self.result_label.value = f"{self._idx + 1} of {len(self._matches)}"
+            self.prev_btn.disabled = self.next_btn.disabled = len(self._matches) == 1
+        else:
+            self.result_label.value = ""
+            self.prev_btn.disabled = self.next_btn.disabled = True
+
         self.page.update()
 
     def _grab_keys(self):
