@@ -1,4 +1,5 @@
-from transformers.integrations import tiktoken
+import tiktoken
+from msp.settings import CHAT_MODEL
 
 
 def count_tokens(text: str) -> int:
