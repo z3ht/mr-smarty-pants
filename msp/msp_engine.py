@@ -381,7 +381,7 @@ def main(page: ft.Page):
     chat = ChatView(expand=True)
 
     input_field = ft.TextField(
-        label="Type…",
+        label="Begin typing...",
         expand=True,
         multiline=True,
         min_lines=1,
@@ -740,6 +740,8 @@ def main(page: ft.Page):
     def _page_key_handler(e: ft.KeyboardEvent):
         if e.key.lower() == "f" and (e.ctrl or e.meta):
             toggle_search()
+        elif e.key.lower() == "n" and (e.ctrl or e.meta):
+            end_conversation()
 
     page.on_keyboard_event = _page_key_handler
 
