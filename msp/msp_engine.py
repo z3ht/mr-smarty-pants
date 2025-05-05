@@ -14,21 +14,22 @@ import sounddevice as sd
 import soundfile as sf
 from PIL import Image
 from mss import mss
-from openai import AsyncOpenAI
 from skimage.metrics import structural_similarity as ssim
 
+from msp.client_selection import get_client
 from msp.chat_search import SearchBar
-from msp.history_utils import unique_history_basename, get_previous_conversation_names, save_last_closed_conversation, get_last_closed_conversation
-from msp.settings import OPENAI_API_KEY, TOKEN_LIMIT_PER_M, WINDOW_NAME, AUDIO_CHUNK_S, WHISPER_MODEL, VOICE_NAME, \
-    TTS_MODEL, ASSETS_DIR, CHAT_MODEL, SCREENSHOT_INTERVAL_S, SCREENSHOT_SIMILARITY_THRESHOLD_PCT, PROJECT_DIR
+from msp.history_utils import unique_history_basename, get_previous_conversation_names, save_last_closed_conversation, \
+    get_last_closed_conversation
+from msp.settings import TOKEN_LIMIT_PER_M, WINDOW_NAME, AUDIO_CHUNK_S, WHISPER_MODEL, VOICE_NAME, \
+    TTS_MODEL, ASSETS_DIR, SCREENSHOT_INTERVAL_S, SCREENSHOT_SIMILARITY_THRESHOLD_PCT, PROJECT_DIR, \
+    CHAT_MODEL
 from msp.context_manager import ContextManager
 from msp.token_cost_estimate import estimate_message_tokens
 from msp.chat_view import ChatView, ChatBubble
 
 
-client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+client = get_client(CHAT_MODEL)
 shutdown_event = threading.Event()
-
 
 class TokenUsageTracker:
     def __init__(self):

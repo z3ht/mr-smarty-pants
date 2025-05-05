@@ -2,8 +2,17 @@ import tiktoken
 from msp.settings import CHAT_MODEL
 
 
+def get_encoding(model_name: str):
+    try:
+        return tiktoken.encoding_for_model(model_name)
+    except KeyError:
+        # Fallback for unknown models
+        # i.e. most lambda models
+        return tiktoken.get_encoding("cl100k_base")
+
+
 def count_tokens(text: str) -> int:
-    encoding = tiktoken.encoding_for_model(CHAT_MODEL)
+    encoding = get_encoding(CHAT_MODEL)
     tokens = encoding.encode(text)
     return len(tokens)
 
