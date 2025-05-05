@@ -425,7 +425,15 @@ def main(page: ft.Page):
     current_stem: str | None = None
     pending_load_stem: str | None = None
 
-    sidebar = ft.Column(spacing=4, width=190)
+    sidebar = ft.Container(
+        content=ft.Column(
+            controls=[],
+            spacing=8,
+            scroll=ft.ScrollMode.AUTO,
+            expand=True,
+        ),
+        width=250
+    )
     sidebar.visible = False
 
     def toggle_sidebar():
@@ -480,7 +488,7 @@ def main(page: ft.Page):
         current_stem = stem_name
 
     def refresh_sidebar():
-        sidebar.controls.clear()
+        sidebar_controls = []
 
         top_buttons = ft.Row(
             [
@@ -488,23 +496,27 @@ def main(page: ft.Page):
                 end_conversation_button,
             ],
             alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-            spacing=8,
+            expand=True
         )
 
-        sidebar.controls.append(
-            ft.Container(top_buttons, padding=0, margin=0, alignment=ft.alignment.center_right)
-        )
-
-        for stem in get_previous_conversation_names():
-            sidebar.controls.append(
+        history_buttons = ft.Column(
+            controls=[
                 ft.TextButton(
                     stem,
                     data=stem,
                     on_click=_load_chat,
                     style=ft.ButtonStyle(padding=ft.padding.symmetric(8, 4)),
                 )
-            )
+                for stem in get_previous_conversation_names()
+            ],
+            spacing=4
+        )
 
+        sidebar_controls.append(top_buttons)
+        sidebar_controls.append(ft.Container(history_buttons, expand=True))
+
+        sidebar.content.controls.clear()
+        sidebar.content.controls.extend(sidebar_controls)
         sidebar.update()
 
     def _load_chat(e: ft.ControlEvent):
