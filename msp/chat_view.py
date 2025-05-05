@@ -95,15 +95,32 @@ class ChatView(ft.Column):
             stripped = line.strip()
 
             if stripped.startswith("```"):
-                in_code_block = not in_code_block
-                current.append(line)
+                if in_code_block:
+                    parts.append("\n".join(current))
+                    parts.append(line)
+                    current = []
+                    in_code_block = False
+                else:
+                    if current:
+                        parts.append("\n".join(current).strip())
+                        current = []
+                    parts.append(line)
+                    in_code_block = True
                 continue
 
-            if not in_code_block and stripped.startswith("#") and current:
-                parts.append("\n".join(current).strip())
-                current = [line]
-            else:
+            if in_code_block:
                 current.append(line)
+            else:
+                if stripped.startswith("#"):
+                    if current:
+                        parts.append("\n".join(current).strip())
+                    current = [line]
+                elif stripped == "":
+                    if current:
+                        parts.append("\n".join(current).strip())
+                    current = []
+                else:
+                    current.append(line)
 
         if current:
             parts.append("\n".join(current).strip())
