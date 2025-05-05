@@ -73,14 +73,61 @@ class ChatView(ft.Column):
 
     def finish_ai(self, bubble: ChatBubble):
         raw_text = bubble.text.value
-        parts = self._split_text(raw_text)
 
+        think_end = raw_text.find("</think>")
+        if think_end != -1:
+            think_content = raw_text[:think_end].replace("<think>", "").strip()
+            main_content = raw_text[think_end + len("</think>"):].strip()
+        else:
+            think_content = None
+            main_content = raw_text
+
+        parts = self._split_text(main_content)
         bubble.update_text(parts[0], italic=False, color=ChatBubble.PALETTE["assistant"][0])
         bubble.data["temporary"] = False
 
+        idx = self._col.controls.index(bubble)
+
+        if think_content:
+            def open_popup(e):
+                dialog = ft.AlertDialog(
+                    modal=True,
+                    title=ft.Text("Thoughts"),
+                    content=ft.Text(think_content, italic=True),
+                    actions=[ft.TextButton("Close", on_click=lambda e: close_dialog(dialog))],
+                    actions_alignment=ft.MainAxisAlignment.END,
+                )
+                self.page.dialog = dialog
+                self.page.overlay.append(dialog)
+                dialog.open = True
+                self.page.update()
+
+            def close_dialog(dialog: ft.AlertDialog):
+                dialog.open = False
+                self.page.update()
+                if dialog in self.page.overlay:
+                    self.page.overlay.remove(dialog)
+                if self.page.dialog == dialog:
+                    self.page.dialog = None
+
+            think_btn = ft.IconButton(
+                icon=ft.icons.TIPS_AND_UPDATES_OUTLINED,
+                tooltip="Show AI thoughts",
+                on_click=open_popup
+            )
+
+            row = ft.Row(
+                controls=[
+                    ft.Container(content=bubble, expand=True),
+                    think_btn
+                ],
+                alignment=ft.MainAxisAlignment.START
+            )
+            self._col.controls[idx] = row
+
         for i, part in enumerate(parts[1:], start=1):
             new_bubble = ChatBubble(part, sender="assistant", temporary=False, identifier=self._next_key("assistant"))
-            self._col.controls.insert(self._col.controls.index(bubble) + i, new_bubble)
+            self._col.controls.insert(idx + i, new_bubble)
 
         if self.page:
             self.page.update()
