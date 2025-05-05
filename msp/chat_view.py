@@ -90,10 +90,15 @@ class ChatView(ft.Column):
 
         if think_content:
             def open_popup(e):
+                scrollable_text = ft.Container(
+                    content=ft.Text(think_content, selectable=True),
+                    expand=True
+                )
+
                 dialog = ft.AlertDialog(
                     modal=True,
                     title=ft.Text("Thoughts"),
-                    content=ft.Text(think_content, italic=True),
+                    content=scrollable_text,
                     actions=[ft.TextButton("Close", on_click=lambda e: close_dialog(dialog))],
                     actions_alignment=ft.MainAxisAlignment.END,
                 )
@@ -220,12 +225,26 @@ class ChatView(ft.Column):
     def save_view(self, stem_name: str):
         file_path = os.path.join(PROJECT_DIR, "history", "view", f"{stem_name}.pkl")
         export = []
+
+        def extract_bubble_text(ctrl):
+            if isinstance(ctrl, ChatBubble):
+                return {
+                    "sender": ctrl.data.get("sender"),
+                    "text": ctrl.text.value,
+                }
+            if isinstance(ctrl, ft.Container) and isinstance(ctrl.content, ChatBubble):
+                return extract_bubble_text(ctrl.content)
+            if isinstance(ctrl, ft.Row):
+                for child in ctrl.controls:
+                    result = extract_bubble_text(child)
+                    if result:
+                        return result
+            return None
+
         for ctrl in self._col.controls:
-            if isinstance(ctrl, ft.Container) and isinstance(ctrl.content, ft.Text):
-                export.append({
-                    "sender": ctrl.data.get("sender") if isinstance(ctrl.data, dict) else None,
-                    "text": ctrl.content.value,
-                })
+            result = extract_bubble_text(ctrl)
+            if result:
+                export.append(result)
 
         with open(file_path, "wb") as f:
             pickle.dump(export, f)
